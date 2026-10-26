@@ -1,5 +1,5 @@
 import type { VoicePrefs } from './prefs.ts'
-import type { RealtimeCallbacks } from './realtime.ts'
+import type { RealtimeCallbacks, TranscriptMeta } from './realtime.ts'
 import type { TurnPhase } from './turn-coordinator.ts'
 import { checkVoiceprint, getVoiceprintStatus, VoiceprintCapture, type VoiceprintGateResult } from './voiceprint.ts'
 
@@ -21,44 +21,46 @@ export class QwenPipelineConnection {
   private speechAudible = false
   private currentSpeechText = ''
   private inputPhase: TurnPhase = 'listening'
-  private readonly bargeInGate = new LocalBargeInGate()
-  private bargeInCandidate = false
-  private bargeInTimer?: ReturnType<typeof setTimeout>
-  private ttsStartedAt = 0
-  private ttsInterruptedForBargeIn = false
   private speechEpoch = 0
+  private pendingSpeechText = ''
+  private pendingSpeechHasAudio = false
   private asrEventTail = Promise.resolve()
-  private readonly quarantinedItems = new Set<string>()
-  private readonly ignoredItems = new Set<string>()
+  private activeUtteranceId?: string
+  private nextUtteranceId = 0
   private readonly utteranceBusy = new Map<string, boolean>()
-  private asrRestarting = false
-  private asrContaminated = false
+  private readonly utteranceSpeech = new Map<string, string>()
+  private readonly completedUtterances = new Set<string>()
   private readonly voiceprintCapture = new VoiceprintCapture()
   private voiceprintDispatchTail = Promise.resolve()
   private voiceprintEpoch = 0
-  private readonly voiceprintHandledItems = new Set<string>()
   private voiceprintConfigured = false
   private voiceprintEnrolled = false
 
   constructor(private readonly prefs: VoicePrefs, private readonly callbacks: RealtimeCallbacks) {}
 
   async connect(): Promise<void> {
+    if (this.disposed) return
     this.callbacks.onState('connecting')
-    if (this.prefs.qwenWorkspaceId.trim() === '') throw new Error('请先在插件设置中填写阿里云百炼 Workspace ID')
+    if (this.prefs.speechService === 'dashscope' && this.prefs.qwenWorkspaceId.trim() === '') throw new Error('请先在插件设置中填写阿里云百炼 Workspace ID')
     if (navigator.mediaDevices?.getUserMedia === undefined) throw new Error('当前页面无法访问麦克风，请用 Chrome 打开此 Harness 地址')
-    this.microphone = await navigator.mediaDevices.getUserMedia({
+    const microphone = await navigator.mediaDevices.getUserMedia({
       // AGC makes distant people louder and caused false turns in a shared
       // room. Keep AEC/NS but prefer a near-field speaker by leaving gain
       // unamplified; users can lower the VAD threshold for quiet microphones.
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false, channelCount: 1 },
     })
+    if (this.disposed) { microphone.getTracks().forEach(track => track.stop()); return }
+    this.microphone = microphone
     if (this.prefs.voiceprintEnabled) {
       const status = await getVoiceprintStatus()
+      if (this.disposed) return
       this.voiceprintConfigured = status.configured
       this.voiceprintEnrolled = status.enrolled
     }
     await this.openTts()
+    if (this.disposed) return
     await this.openAsr()
+    if (this.disposed) return
     this.startCapture()
   }
 
@@ -80,6 +82,8 @@ export class QwenPipelineConnection {
       await new Promise<void>((resolve, reject) => {
         this.speechResolve = resolve
         this.speechReject = reject
+        this.pendingSpeechText = chunk
+        this.pendingSpeechHasAudio = false
         this.sendTts({ type: 'input_text_buffer.append', event_id: eventId(), text: chunk })
         this.sendTts({ type: 'input_text_buffer.commit', event_id: eventId() })
       })
@@ -87,38 +91,44 @@ export class QwenPipelineConnection {
   }
 
   async waitForSpeechIdle(): Promise<void> {
+    const epoch = this.speechEpoch
     await this.player.waitUntilIdle()
+    if (epoch !== this.speechEpoch) return
     this.speechAudible = false
     this.currentSpeechText = ''
   }
 
+  pauseSpeech(): void { this.player.pause() }
+
+  resumeSpeech(): void { this.player.resume() }
+
   cancelSpeech(): void {
     this.speechEpoch++
-    if (this.isTtsActive() || this.speechResolve !== undefined || this.speechReject !== undefined) this.interruptTts()
+    this.player.stop()
+    const error = new Error('语音播放已被用户打断')
+    this.speechReject?.(error)
+    this.rejectTtsReady?.(error)
+    this.speechResolve = undefined
+    this.speechReject = undefined
+    this.resolveTtsReady = undefined
+    this.rejectTtsReady = undefined
+    this.pendingSpeechText = ''
+    this.pendingSpeechHasAudio = false
+    const socket = this.tts
+    this.tts = undefined
+    this.ttsReady = undefined
+    socket?.close(1000, 'speech cancelled')
+    this.speechAudible = false
+    this.currentSpeechText = ''
   }
 
   setInputPhase(phase: TurnPhase): void {
-    if (this.inputPhase === phase) return
     this.inputPhase = phase
-    if (phase === 'tts-speaking') {
-      this.ttsStartedAt = Date.now()
-      this.ttsInterruptedForBargeIn = false
-      this.resetBargeIn(false)
-      return
-    }
-    if (phase === 'post-playback') {
-      if (this.bargeInCandidate) this.rejectFalseBargeIn()
-      else {
-        this.resetBargeIn(true)
-        if (this.asrContaminated) this.restartAsr()
-      }
-      return
-    }
-    if (phase === 'listening' || phase === 'harness' || phase === 'tts-pending') this.resetBargeIn(false)
   }
 
   disconnect(): void {
     this.disposed = true
+    this.cancelSpeech()
     this.player.dispose()
     this.processor?.disconnect()
     this.captureSource?.disconnect()
@@ -126,32 +136,31 @@ export class QwenPipelineConnection {
     void this.captureContext?.close()
     this.microphone?.getTracks().forEach(track => track.stop())
     finishAndClose(this.asr)
-    finishAndClose(this.tts)
     this.asr = undefined
     this.tts = undefined
-    this.speechReject?.(new Error('语音连接已关闭'))
-    this.speechResolve = undefined
-    this.speechReject = undefined
-    this.speechAudible = false
-    this.currentSpeechText = ''
-    this.resetBargeIn(false)
-    this.quarantinedItems.clear()
-    this.ignoredItems.clear()
+    this.activeUtteranceId = undefined
+    this.utteranceSpeech.clear()
+    this.completedUtterances.clear()
     this.utteranceBusy.clear()
     this.voiceprintCapture.clear()
-    this.voiceprintHandledItems.clear()
     this.voiceprintEpoch++
     this.voiceprintDispatchTail = Promise.resolve()
   }
 
   private async openAsr(): Promise<void> {
-    const socket = new WebSocket(proxyUrl('asr', this.prefs.qwenWorkspaceId, this.prefs.qwenRegion, this.prefs.qwenAsrModel))
+    const socket = new WebSocket(proxyUrl('asr', this.prefs))
     this.asr = socket
     await opened(socket)
+    if (this.disposed || this.asr !== socket) { socket.close(); return }
     socket.onmessage = event => {
-      this.asrEventTail = this.asrEventTail.then(() => this.handleAsr(event.data), () => this.handleAsr(event.data))
+      const handle = async (): Promise<void> => {
+        if (!this.disposed && this.asr === socket) await this.handleAsr(event.data)
+      }
+      this.asrEventTail = this.asrEventTail.then(handle, handle)
     }
-    socket.onerror = () => this.callbacks.onState('error', '千问专用 ASR 连接失败')
+    socket.onerror = () => {
+      if (!this.disposed && this.asr === socket) this.callbacks.onState('error', '千问专用 ASR 连接失败')
+    }
     socket.onclose = () => {
       if (this.asr !== socket) return
       this.asr = undefined
@@ -179,22 +188,26 @@ export class QwenPipelineConnection {
       this.resolveTtsReady = resolve
       this.rejectTtsReady = reject
     })
-    const socket = new WebSocket(proxyUrl('tts', this.prefs.qwenWorkspaceId, this.prefs.qwenRegion, this.prefs.qwenTtsModel))
+    const socket = new WebSocket(proxyUrl('tts', this.prefs))
     this.tts = socket
     // Qwen may emit session.created immediately after the WebSocket opens.
     // Install handlers first or a fast connection can miss that first event
     // and leave the UI stuck in "connecting" forever.
-    socket.onmessage = event => this.handleTts(event.data)
-    socket.onerror = () => this.rejectTtsReady?.(new Error('千问专用 TTS 连接失败'))
+    socket.onmessage = event => {
+      if (!this.disposed && this.tts === socket) this.handleTts(event.data)
+    }
+    socket.onerror = () => {
+      if (this.tts === socket) this.rejectTtsReady?.(new Error('千问专用 TTS 连接失败'))
+    }
     socket.onclose = () => {
       if (this.tts !== socket) return
       this.tts = undefined
+      this.rejectTtsReady?.(new Error('千问专用 TTS 已断开'))
       this.speechReject?.(new Error('千问专用 TTS 已断开'))
       this.speechResolve = undefined
       this.speechReject = undefined
     }
-    await opened(socket)
-    await this.ttsReady
+    await Promise.all([opened(socket), this.ttsReady])
   }
 
   private startCapture(): void {
@@ -208,22 +221,9 @@ export class QwenPipelineConnection {
       if (this.asr?.readyState !== WebSocket.OPEN) return
       const pcm = downsampleToPcm16(event.inputBuffer.getChannelData(0), context.sampleRate, 16000)
       if (pcm.byteLength === 0 || this.asr.bufferedAmount > 512 * 1024) return
-      if (this.inputPhase === 'post-playback') return
-      if (this.inputPhase === 'tts-speaking') {
-        if (!this.speechAudible && !this.player.isPlaying) return
-        const decision = this.bargeInGate.push(pcm, Date.now() - this.ttsStartedAt)
-        if (!decision.forward) return
-        if (!this.bargeInCandidate) {
-          this.bargeInCandidate = true
-          this.asrContaminated = true
-          this.player.pause()
-          this.bargeInTimer = setTimeout(() => this.rejectFalseBargeIn(), 2_200)
-          for (const frame of decision.preRoll) this.appendAsr(frame)
-          return
-        }
-      } else {
-        this.bargeInGate.observe(pcm)
-      }
+      // Capture remains continuous during playback and soft pauses. Browser
+      // AEC handles the playback reference; semantic echo checks are metadata,
+      // never a reason to discard microphone frames.
       this.appendAsr(pcm)
     }
     source.connect(processor)
@@ -236,76 +236,62 @@ export class QwenPipelineConnection {
   }
 
   private async handleAsr(raw: unknown): Promise<void> {
+    if (this.disposed) return
     const event = jsonEvent(raw)
     if (event === undefined) return
     const type = event.type
     if (type === 'session.updated') this.callbacks.onState('listening')
     if (type === 'input_audio_buffer.speech_started') {
-      this.callbacks.onSpeechStart?.()
-      const itemId = typeof event.item_id === 'string' ? event.item_id : ''
-      if (itemId !== '') {
-        if (this.prefs.voiceprintEnabled) this.voiceprintCapture.start(itemId)
-        this.utteranceBusy.set(itemId, this.inputPhase !== 'listening' && this.inputPhase !== 'endpoint-candidate')
-        if (this.bargeInCandidate) this.quarantinedItems.add(itemId)
-      }
+      const itemId = typeof event.item_id === 'string' ? event.item_id : `asr-${++this.nextUtteranceId}`
+      this.activeUtteranceId = itemId
+      this.utteranceBusy.set(itemId, this.inputPhase !== 'listening' && this.inputPhase !== 'endpoint-candidate')
+      this.utteranceSpeech.set(itemId, this.currentSpeechText)
+      if (this.prefs.voiceprintEnabled) this.voiceprintCapture.start(itemId)
+      if (this.speechAudible || this.player.isPlaying || this.speechResolve !== undefined) this.pauseSpeech()
+      this.callbacks.onSpeechStart?.({ utteranceId: itemId, capturedWhileBusy: this.utteranceBusy.get(itemId) })
     }
     if (type === 'input_audio_buffer.speech_stopped') {
-      this.callbacks.onSpeechEnd?.()
-      if (this.prefs.voiceprintEnabled) {
-        const itemId = typeof event.item_id === 'string' ? event.item_id : ''
-        this.voiceprintCapture.stop(itemId)
-      }
+      const itemId = typeof event.item_id === 'string' ? event.item_id : this.activeUtteranceId
+      this.callbacks.onSpeechEnd?.({ utteranceId: itemId })
+      if (this.prefs.voiceprintEnabled && itemId !== undefined) this.voiceprintCapture.stop(itemId)
     }
-    if (type === 'conversation.item.input_audio_transcription.text' && this.bargeInCandidate) {
-      const confirmed = typeof event.text === 'string' ? event.text : ''
-      const stash = typeof event.stash === 'string' ? event.stash : ''
-      const preview = `${confirmed}${stash}`.trim()
-      if (isExplicitBargeIn(normalizeSpeech(preview)) && !isLikelyTtsEcho(preview, this.currentSpeechText)) this.interruptTts()
-    }
-    if (type === 'conversation.item.input_audio_transcription.completed') {
-      const transcript = typeof event.transcript === 'string' ? event.transcript.trim() : ''
-      const itemId = typeof event.item_id === 'string' ? event.item_id : ''
-      if (this.prefs.voiceprintEnabled && itemId !== '') {
-        if (this.voiceprintHandledItems.has(itemId)) {
-          this.voiceprintCapture.discard(itemId)
-          return
-        }
-        this.voiceprintHandledItems.add(itemId)
-        while (this.voiceprintHandledItems.size > 128) this.voiceprintHandledItems.delete(this.voiceprintHandledItems.values().next().value as string)
+    if (type === 'conversation.item.input_audio_transcription.text'
+      || type === 'conversation.item.input_audio_transcription.completed') {
+      const itemId = typeof event.item_id === 'string' ? event.item_id : (this.activeUtteranceId ??= `asr-${++this.nextUtteranceId}`)
+      if (this.completedUtterances.has(itemId)) return
+      const final = type === 'conversation.item.input_audio_transcription.completed'
+      const transcript = final
+        ? typeof event.transcript === 'string' ? event.transcript.trim() : ''
+        : `${typeof event.text === 'string' ? event.text : ''}${typeof event.stash === 'string' ? event.stash : ''}`.trim()
+      const meta: TranscriptMeta = {
+        utteranceId: itemId,
+        capturedWhileBusy: this.utteranceBusy.get(itemId) ?? (this.inputPhase !== 'listening' && this.inputPhase !== 'endpoint-candidate'),
+        likelyEcho: isLikelyTtsEcho(transcript, this.utteranceSpeech.get(itemId) ?? this.currentSpeechText),
       }
-      const capturedWhileBusy = itemId !== ''
-        ? (this.utteranceBusy.get(itemId) ?? (this.inputPhase !== 'listening' && this.inputPhase !== 'endpoint-candidate'))
-        : (this.inputPhase !== 'listening' && this.inputPhase !== 'endpoint-candidate')
-      if (itemId !== '') this.utteranceBusy.delete(itemId)
-      if (itemId !== '' && this.ignoredItems.delete(itemId)) {
-        this.voiceprintCapture.discard(itemId)
+      if (!final) {
+        this.callbacks.onPartialTranscript?.(transcript, meta)
         return
       }
-      const quarantined = this.bargeInCandidate || (itemId !== '' && this.quarantinedItems.delete(itemId))
-      if (quarantined && (!isActionableTranscript(transcript) || isLikelyTtsEcho(transcript, this.currentSpeechText))) {
-        this.voiceprintCapture.discard(itemId)
-        this.rejectFalseBargeIn()
-        return
-      }
-      if (!isActionableTranscript(transcript)) {
-        this.voiceprintCapture.discard(itemId)
-        return
-      }
-      if (quarantined) this.interruptTts()
-      if (this.inputPhase === 'post-playback' && !quarantined) {
-        this.voiceprintCapture.discard(itemId)
-        return
-      }
-      if (this.prefs.voiceprintEnabled) {
+      this.completedUtterances.add(itemId)
+      while (this.completedUtterances.size > 128) this.completedUtterances.delete(this.completedUtterances.values().next().value as string)
+      this.utteranceBusy.delete(itemId)
+      this.utteranceSpeech.delete(itemId)
+      if (this.activeUtteranceId === itemId) this.activeUtteranceId = undefined
+      // Deliver even fillers and likely echoes. The turn controller needs the
+      // final event to resolve its reversible pause; it owns the decision.
+      if (this.prefs.voiceprintEnabled && isActionableTranscript(transcript)) {
         this.voiceprintDispatchTail = this.voiceprintDispatchTail.then(
-          () => this.dispatchVoiceprintTranscript(itemId, transcript, capturedWhileBusy),
-          () => this.dispatchVoiceprintTranscript(itemId, transcript, capturedWhileBusy),
-        )
+          () => this.dispatchVoiceprintTranscript(itemId, transcript, meta),
+          () => this.dispatchVoiceprintTranscript(itemId, transcript, meta),
+        ).catch(error => {
+          if (!this.disposed) this.callbacks.onState('error', error instanceof Error ? error.message : String(error))
+        })
         return
       }
-      await this.callbacks.onTranscript?.(transcript, {
-        capturedWhileBusy,
-        voiceprint: this.prefs.voiceprintEnabled ? 'approved' : undefined,
+      this.voiceprintCapture.discard(itemId)
+      if (this.prefs.voiceprintEnabled) meta.voiceprint = 'unavailable'
+      void this.callbacks.onTranscript?.(transcript, meta).catch(error => {
+        if (!this.disposed) this.callbacks.onState('error', error instanceof Error ? error.message : String(error))
       })
     }
     if (type === 'error') this.callbacks.onState('error', safeError(event))
@@ -333,13 +319,25 @@ export class QwenPipelineConnection {
       this.rejectTtsReady = undefined
     }
     if (event.type === 'response.audio.delta' && typeof event.delta === 'string') {
+      const epoch = this.speechEpoch
+      const socket = this.tts
       if (!this.speechAudible) {
         this.speechAudible = true
         this.callbacks.onState('speaking')
       }
+      // The first-audio callback can reject a stale interjection synchronously.
+      // Do not enqueue its frame after cancelSpeech has cleared the player.
+      if (this.disposed || epoch !== this.speechEpoch || socket !== this.tts) return
+      this.pendingSpeechHasAudio = true
       this.player.enqueue(event.delta, 24000)
     }
     if (event.type === 'response.done') {
+      if (this.pendingSpeechHasAudio) {
+        const text = this.pendingSpeechText
+        this.player.whenCurrentAudioEnds(() => this.callbacks.onPlaybackProgress?.(text))
+      }
+      this.pendingSpeechText = ''
+      this.pendingSpeechHasAudio = false
       this.speechResolve?.()
       this.speechResolve = undefined
       this.speechReject = undefined
@@ -351,44 +349,6 @@ export class QwenPipelineConnection {
       this.speechResolve = undefined
       this.speechReject = undefined
     }
-  }
-
-  private isTtsActive(): boolean {
-    return this.speechAudible || this.player.isPlaying
-  }
-
-  private interruptTts(): void {
-    if (this.ttsInterruptedForBargeIn) return
-    this.ttsInterruptedForBargeIn = true
-    this.player.stop()
-    const rejectSpeech = this.speechReject
-    this.speechResolve = undefined
-    this.speechReject = undefined
-    rejectSpeech?.(new Error('语音播放已被用户打断'))
-    const socket = this.tts
-    if (socket !== undefined) socket.close(1000, 'barge-in')
-    this.tts = undefined
-    this.ttsReady = undefined
-    this.speechAudible = false
-    this.currentSpeechText = ''
-    this.resetBargeIn(false)
-    if (!this.disposed) void this.openTts().catch(error => this.callbacks.onState('error', error instanceof Error ? error.message : String(error)))
-  }
-
-  private rejectFalseBargeIn(): void {
-    if (!this.bargeInCandidate) return
-    for (const itemId of this.quarantinedItems) this.ignoredItems.add(itemId)
-    this.quarantinedItems.clear()
-    this.resetBargeIn(true)
-    this.restartAsr()
-  }
-
-  private resetBargeIn(resume: boolean): void {
-    if (this.bargeInTimer !== undefined) clearTimeout(this.bargeInTimer)
-    this.bargeInTimer = undefined
-    this.bargeInCandidate = false
-    this.bargeInGate.reset()
-    if (resume) this.player.resume()
   }
 
   private appendAsr(pcm: Int16Array): void {
@@ -407,13 +367,15 @@ export class QwenPipelineConnection {
     })
   }
 
-  private async dispatchVoiceprintTranscript(itemId: string, transcript: string, capturedWhileBusy: boolean): Promise<void> {
+  private async dispatchVoiceprintTranscript(itemId: string, transcript: string, meta: TranscriptMeta): Promise<void> {
+    if (this.disposed) return
     const epoch = this.voiceprintEpoch
     this.voiceprintCapture.stop(itemId)
     const voiceprint = await this.beginVoiceprintCheck(itemId)
     if (this.disposed || epoch !== this.voiceprintEpoch) return
     if (voiceprint.status === 'enrolled') {
       this.callbacks.onState('listening', '声纹录入成功；请再说一次刚才的指令')
+      await this.callbacks.onTranscript?.('', { ...meta, voiceprint: 'unavailable' })
       return
     }
     if (voiceprint.status !== 'approved') {
@@ -422,28 +384,13 @@ export class QwenPipelineConnection {
         : '声纹暂不可用；文字已保留，可手动发送'
       this.callbacks.onState('listening', detail)
       await this.callbacks.onTranscript?.(transcript, {
+        ...meta,
         capturedWhileBusy: true,
         voiceprint: voiceprint.status,
       })
       return
     }
-    await this.callbacks.onTranscript?.(transcript, { capturedWhileBusy, voiceprint: 'approved' })
-  }
-
-  private restartAsr(): void {
-    if (this.disposed || this.asrRestarting) return
-    this.asrRestarting = true
-    this.asrContaminated = false
-    this.voiceprintCapture.clear()
-    this.voiceprintHandledItems.clear()
-    this.voiceprintEpoch++
-    this.voiceprintDispatchTail = Promise.resolve()
-    const socket = this.asr
-    this.asr = undefined
-    socket?.close(1000, 'reset contaminated input')
-    void this.openAsr().catch(error => {
-      if (!this.disposed) this.callbacks.onState('error', error instanceof Error ? error.message : String(error))
-    }).finally(() => { this.asrRestarting = false })
+    await this.callbacks.onTranscript?.(transcript, { ...meta, voiceprint: 'approved' })
   }
 
   private sendAsr(event: unknown): void { this.asr?.send(JSON.stringify(event)) }
@@ -507,57 +454,6 @@ function bigramDice(left: string, right: string): number {
   return (2 * overlap) / (left.length + right.length - 2)
 }
 
-export class LocalBargeInGate {
-  private noiseFloor = 0.006
-  private activeMs = 0
-  private candidate = false
-  private bufferedMs = 0
-  private frames: Array<{ pcm: Int16Array; durationMs: number }> = []
-
-  observe(pcm: Int16Array): void {
-    const level = pcmRms(pcm)
-    if (level < 0.05) this.noiseFloor = (this.noiseFloor * 0.98) + (level * 0.02)
-  }
-
-  push(pcm: Int16Array, playbackElapsedMs: number): { forward: boolean; preRoll: Int16Array[] } {
-    const durationMs = (pcm.length / 16_000) * 1_000
-    this.frames.push({ pcm: pcm.slice(), durationMs })
-    this.bufferedMs += durationMs
-    while (this.bufferedMs > 850 && this.frames.length > 1) {
-      const removed = this.frames.shift()
-      if (removed !== undefined) this.bufferedMs -= removed.durationMs
-    }
-    if (this.candidate) return { forward: true, preRoll: [] }
-    // The first playback frames are the most likely to leak through AEC. This
-    // mirrors mature realtime stacks that require some audible output before
-    // accepting barge-in.
-    if (playbackElapsedMs < 350) return { forward: false, preRoll: [] }
-    const threshold = Math.max(0.018, this.noiseFloor * 3.2)
-    const level = pcmRms(pcm)
-    this.activeMs = level >= threshold ? this.activeMs + durationMs : Math.max(0, this.activeMs - (durationMs * 1.5))
-    if (this.activeMs < 500) return { forward: false, preRoll: [] }
-    this.candidate = true
-    return { forward: true, preRoll: this.frames.map(frame => frame.pcm) }
-  }
-
-  reset(): void {
-    this.activeMs = 0
-    this.candidate = false
-    this.bufferedMs = 0
-    this.frames = []
-  }
-}
-
-function pcmRms(pcm: Int16Array): number {
-  if (pcm.length === 0) return 0
-  let sum = 0
-  for (let index = 0; index < pcm.length; index++) {
-    const value = (pcm[index] ?? 0) / 32768
-    sum += value * value
-  }
-  return Math.sqrt(sum / pcm.length)
-}
-
 class PcmPlayer {
   private context?: AudioContext
   private gain?: GainNode
@@ -565,6 +461,8 @@ class PcmPlayer {
   private sources = new Set<AudioBufferSourceNode>()
   private idleWaiters: Array<() => void> = []
   private paused = false
+  private lastSource?: AudioBufferSourceNode
+  private completionMarkers = new Map<AudioBufferSourceNode, Array<() => void>>()
 
   get isPlaying(): boolean { return this.sources.size > 0 }
 
@@ -572,6 +470,7 @@ class PcmPlayer {
     const bytes = fromBase64(encoded)
     if (bytes.byteLength < 2) return
     const context = this.context ??= new AudioContext()
+    if (this.paused && context.state !== 'suspended') void context.suspend()
     if (this.gain === undefined) {
       this.gain = context.createGain()
       this.gain.connect(context.destination)
@@ -588,36 +487,44 @@ class PcmPlayer {
     source.start(start)
     this.nextStart = start + buffer.duration
     this.sources.add(source)
+    this.lastSource = source
     source.onended = () => {
       this.sources.delete(source)
+      const markers = this.completionMarkers.get(source)
+      this.completionMarkers.delete(source)
+      markers?.forEach(marker => marker())
       this.resolveIdle()
     }
   }
 
-  duck(enabled: boolean): void {
-    if (this.gain !== undefined && this.context !== undefined) {
-      this.gain.gain.setTargetAtTime(enabled ? 0.25 : 1, this.context.currentTime, 0.03)
-    }
+  whenCurrentAudioEnds(callback: () => void): void {
+    const last = this.lastSource
+    if (last === undefined) return
+    if (!this.sources.has(last)) { callback(); return }
+    const markers = this.completionMarkers.get(last) ?? []
+    markers.push(callback)
+    this.completionMarkers.set(last, markers)
   }
 
   pause(): void {
-    if (this.context === undefined || this.paused) return
+    if (this.paused) return
     this.paused = true
-    void this.context.suspend()
+    void this.context?.suspend()
   }
 
   resume(): void {
-    if (this.context === undefined || !this.paused) return
+    if (!this.paused) return
     this.paused = false
-    void this.context.resume()
+    void this.context?.resume()
   }
 
   stop(): void {
+    this.completionMarkers.clear()
+    this.lastSource = undefined
     this.resume()
     for (const source of this.sources) { try { source.stop() } catch { /* already stopped */ } }
     this.sources.clear()
     this.nextStart = 0
-    this.duck(false)
     this.resolveIdle()
   }
 
@@ -634,9 +541,15 @@ class PcmPlayer {
   dispose(): void { this.stop(); void this.context?.close(); this.context = undefined; this.gain = undefined; this.paused = false }
 }
 
-function proxyUrl(kind: 'asr' | 'tts', workspaceId: string, region: string, model: string): string {
+function proxyUrl(kind: 'asr' | 'tts', prefs: VoicePrefs): string {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const query = new URLSearchParams({ workspaceId, region, model })
+  const service = prefs.speechService ?? 'token-plan'
+  const query = new URLSearchParams({
+    service,
+    workspaceId: service === 'token-plan' ? 'token-plan' : prefs.qwenWorkspaceId,
+    region: service === 'token-plan' ? 'cn-beijing' : prefs.qwenRegion,
+    model: kind === 'asr' ? prefs.qwenAsrModel : prefs.qwenTtsModel,
+  })
   return `${protocol}//${location.host}/dsh-realtime-voice/${kind}/qwen?${query}`
 }
 

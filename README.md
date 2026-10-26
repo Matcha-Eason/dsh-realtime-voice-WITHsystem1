@@ -1,119 +1,70 @@
-# dsh-realtime-voice
+# DSH Realtime Voice · System 1
 
-DeepSeek Harness 的轻量实时语音插件。不包含 Docker、Python或本地模型。千问线路是确定性的三段式管线：浏览器采集 PCM，Harness Host 以同源 WebSocket 代理专用 ASR/TTS；空闲时完整语句经原生输入框自动交给当前 Harness 会话，忙时的新语音先合并到输入框，播报结束后按可配置停留时间安全续发，语音厂商没有独立回答的机会。
+在 DeepSeek Harness 当前会话上增加语音自动发送、双向打断和主动澄清。**所有播报文字均由当前会话的主模型生成**；百炼决策模型只返回轮次动作，ASR 只转写，TTS 只合成。
 
-![DeepSeek Harness 实时语音插件设置](https://raw.githubusercontent.com/zfu691531-hash/dsh-realtime-voice/main/screenshots/settings.png)
+本分支基于 [dsh-realtime-voice](https://github.com/zfu691531-hash/dsh-realtime-voice) 改造，保留 MIT 许可。当前开发目标是 DSH `0.2.1-rc.2` 的原生 Session API。
 
-## 能力
+## 已实现
 
-- 国内线路：`qwen3-asr-flash-realtime → DeepSeek Harness → qwen3-tts-flash-realtime`（阿里云百炼，北京/新加坡）。
-- 全球线路：`gpt-realtime-2.1`（OpenAI Realtime）。
-- 千问使用两个独立语音模型：ASR 只转写，TTS 只播报；不再使用 Omni Realtime 作为对话模型。
-- ASR final 统一经过原生输入框：空闲且输入框为空时，在续说窗口结束后自动调用原生发送；Harness 推理或播报期间捕获的后续语音先取得一个仅限 ASR 草稿的发送租约，全部播报结束后再等待默认 `1800ms`，期间没有续说或键盘编辑才提交完整草稿。推理、记忆、联网、插件与工具调度全部由 Harness 完成。
-- VAD 默认 `threshold=0.85`、尾静音 `700ms`，并关闭浏览器自动增益以优先近讲。ASR final 先进入候选断句，再等待 `1200ms` 的续说窗口；从停顿开始约 `1.9s` 才提交 Harness，期间继续说话仍属于同一轮。
-- 严格的 `TurnCoordinator` 为每轮分配唯一 ID，并串行处理 ASR 状态事件；旧轮的迟到回调不能再启动 Harness、覆盖新轮或播放过期语音。
-- Harness 执行工具期间，普通背景转写不会再取消当前任务；只有明确说“停止 / 取消 / 算了”才会中止。
-- Harness 正在推理或 TTS 正在播报时，新语音只追加到原生输入框；播报结束后不会跳过这些文字。新的 `speech_started` 会暂停倒计时，只有 `speech_stopped` 后才允许恢复，后续 ASR final 合并后重新计时；键盘编辑、粘贴、清空、手动发送、连接停止或草稿版本不匹配都会撤销自动发送，避免长句中途提交和重复提交。
-- 后续草稿自动发送默认开启，但默认要求已通过声纹；未启用声纹时需在设置中显式允许。声纹拒绝/不可用、取消口令，以及转账、支付、删除、关机等敏感文本只保留在输入框等待人工确认。
-- 语音模式开启期间，插件旁路观察用户手动提交的原生 Harness turn，流式提取口语摘要并交给 TTS；不需要插件再次提交相同消息。
-- TTS 使用 24kHz PCM 流式播放。播报期间麦克风音频先留在浏览器本地，不会直接污染云端 ASR；经过播放预热且检测到至少 `500ms` 持续近讲后，才暂停播放器并把带预卷的候选音频交给 ASR。
-- 候选插话经过文本有效性与播报回声相似度复核；误触发会恢复原播报，确认插话才停止 TTS。插话文字只进入原生输入框，等待用户发送或清空，不会自动抢开第二个 Harness 任务。
-- TTS 播放结束后保留 `400ms` 防回声窗口，清理残留 ASR 缓冲后才重新进入监听。
-- 实时语音轮次要求 Harness 把 1–2 句自然口语结论放在第一段，空行后再写详细结果；插件在第一段每个完整句子生成时立即提交 TTS，不等待详细正文或 `turn/end`。聊天界面不再显示任何 `voice-summary`/HTML 边界，TTS 只消费 `text-delta`，绝不读取 `reasoning-delta`、工具过程或后续详情。
-- 插件在 t=0 并行请求当前语音供应商的轻量文本模型；实际等待超过默认 `800ms` 且仍没有正文时，才播出依据脱敏短主题、Harness 工具/重试阶段和此前接场句临时生成的自然承接，不再依赖固定话术库。长等待最多三句且不会重复；快回答会取消未播接场。接场和结果共用同一 TTS 单写者队列，不写 Harness 历史，也不读取 reasoning 或 tool payload。
-- 千问线路可选腾讯云声纹“抗干扰软门控”。开启后首句至少 1 秒的人声只用于显式录入，后续每个 ASR utterance 在 Host 侧验证；未通过、凭据缺失或服务超时均只把文字留在原生输入框，不自动提交 Harness。声纹不是身份认证，不能授权高风险操作。
-- 同一会话只允许一个语音委派。排队任务使用定向删除，运行中任务才会取消当前 turn，避免误伤原有工作。
-- API Key 只由 Host 的凭据服务按请求读取，不写入浏览器、`localStorage`、包文件或日志。
+- 语音经原生输入框自动发送。续说合并；键盘编辑、清空、手动发送会撤销该草稿的自动发送权。
+- 播报期间持续收音。起声先暂停播放，决策区分附和、接管话轮和明确取消；附和可以续播，普通打断只停止说话，明确取消才停止对应 DSH 任务。
+- 主模型忙时暂存新语音，空闲后按当前草稿和轮次判断提交。
+- 决策模型可以请求一次短澄清，由同一个 DSH 主模型生成。输入变化或用户重新起声会取消尚未播出的旧候选。
+- 流式读取主模型的可见回答并分句播报，过滤代码块和 Markdown 标记，不读取推理或工具结果。已播记录以完整播报片段计，不冒充逐字播放进度。
+- 取消、重试、迟到转写、过时决策和过时音频均有对应生命周期检查。
 
-## 安装
+## 本地启动
 
-推荐直接从带版本标签的 GitHub 仓库安装：
+需要 Node.js 22+，以及已经构建的 DSH 源码，默认位于相邻目录 `../deepseek-harness`。这个 checkout 的依赖和构建已准备好。
 
 ```bash
-dsh plugin --profile web add github:zfu691531-hash/dsh-realtime-voice#v0.12.0
-```
-
-仓库提交预构建 `lib/`，因此这条命令不需要本机 TypeScript、源码 checkout 或 pnpm `allowBuilds`。重启 DeepSeek Harness 后，在“设置 → 插件”展开“实时语音（千问 / GPT）”。
-
-也可以下载同版本 GitHub Release 中的预构建 tarball 后执行：
-
-```bash
-dsh plugin --profile web add ./dsh-realtime-voice-0.12.0.tgz
-```
-
-也可以从源码自行验收并打包：
-
-```bash
-npm install --ignore-scripts
+# 首次安装或依赖变化时
+npm ci --ignore-scripts
 npm run dev:link-dsh
 npm run check
-npm pack
+
+# 首次配置时复制模板，填写 Host 凭据；已有 .env.local 则保留
+cp .env.example .env.local
+
+# 启动本项目专用 DSH 实例
+npm run dev:dsh
 ```
 
-源码构建需要本机已安装 DeepSeek Harness；`dev:link-dsh` 只把类型检查和打包所需的 Harness 包链接进当前开发目录。普通用户安装 Release tarball 不需要执行这一步。
+`.env.local` 中设置 `BAILIAN_TOKEN_PLAN_API_KEY`。凭据仅由 Host 读取；本文件与 `.local/` 均被 Git 忽略。`DSH_SOURCE_ROOT`、`DSH_VOICE_PORT` 和 `DSH_VOICE_MAIN_MODEL` 可以覆盖源码位置、端口和开发配置的默认主模型。
 
-### 卸载
+启动器使用 `.local/dsh` 与 `.local/agents` 保存独立 profile、配置和测试会话。打开终端打印的本地链接，在输入框右侧开启麦克风；“左下角账号菜单 → 设置 → 内置插件 → 实时语音”可调整轮次判断与主动澄清。主模型使用 DSH 自己的模型选择器。
+
+当前启动默认端口为 `3081`，主模型为 `deepseek-v4.1-flash`。修改插件后执行 `npm run build`，重启开发实例并刷新页面。
+
+## 百炼 Token Plan
+
+| 职责 | 默认模型 / 接口 |
+|---|---|
+| 主模型 | `deepseek-v4.1-flash`，由 DSH 调用兼容接口 |
+| 轮次决策 | `decision-model-preview`，`/systemone` |
+| ASR | `qwen-audio-3.0-asr-flash`，HTTP 分段识别 |
+| TTS | `qwen-audio-3.0-tts-plus`，inference WebSocket |
+| 音色 | `longanlingxin` |
+
+**当前套餐中的独立 ASR 是 HTTP 模型，不是原生流式 ASR。** Host 用本地 VAD、约一秒的预览窗口和最终识别结果提供持续转写，最多一个识别请求在途。预览会重复识别增长中的音频窗口，因此延迟和用量需要实测；不能把它当成毫秒级端到端实时系统。不会自动切换到按量计费服务。
+
+如需独立 DashScope 实时 ASR，可在设置中明确选择“百炼按量服务”，另外配置 `DASHSCOPE_API_KEY` 和匹配的模型、音色；详见 [配置](docs/EXAMPLE_CONFIG.md)。
+
+## 验证
 
 ```bash
-dsh plugin --profile web remove dsh-realtime-voice
+npm run check          # 类型、单元测试、构建和浏览器 bundle 边界
+npm run check:bailian  # 使用 .env.local，真实调用主模型、决策、TTS、ASR
 ```
 
-重启 Harness 后插件的 Host 路由、客户端槽位和语音上下文会随 Cordis disposer 一并移除。凭据由 Harness 统一管理，卸载插件不会擅自删除用户凭据。
+真实接口测试使用一条合成测试语音，经插件 Host 代理完成 TTS → ASR 回环，不读取麦克风。已验证默认主模型和决策接口，以及默认 TTS 音色和 ASR 请求格式。
 
-### Doctor
+回归测试覆盖原生会话委派、转写修订、草稿所有权、双向打断、附和续播、插话过期、重试和取消。真实麦克风、扬声器回声、不同浏览器和长时间对话仍需人工验收；建议先用耳机测试。
 
-先运行 `dsh plugin --profile web list` 确认安装版本，再在 Harness 已打开的浏览器页面执行：
+## 当前范围
 
-```js
-await fetch('/dsh-realtime-voice/status').then(response => response.json())
-```
+这是 DSH 插件版本。独立客户端、Jev 本地推理和键盘输入的免回车发送尚未实现；已经实现的是**语音转写自动发送**。主动澄清使用同一个主模型，必须等待它生成回答，不承诺即时接场；其“不要调用工具”目前是主模型指令约束。
 
-完整示例配置与排障见 [`docs/EXAMPLE_CONFIG.md`](docs/EXAMPLE_CONFIG.md)。
+没有独立答题的语音模型、轻量接场模型或预写播报句。可选腾讯声纹后端保留兼容，默认关闭，当前简化设置页未提供录入管理界面。
 
-## DSH 插件规范
-
-- 仓库根目录即独立插件包，不依赖另一个社区仓库。
-- `package.json` 通过 `dsh.bundle.patch` 声明组合包，patch 指向本包的 Host 与 Client 入口。
-- `cordis.patch.yml` 只贡献本插件自己的服务行，不覆盖用户 profile 的其他插件。
-- GitHub 标签固定版本，预构建产物随源码提交；安装不会运行第三方构建脚本。
-- API Key 由 Harness credentials 服务解析，浏览器端只拿到临时语音连接，不持久化密钥。
-
-## 配置
-
-在 Harness 的凭据配置中提供所选线路的引用：
-
-- 千问：`DASHSCOPE_API_KEY`，并在插件设置里填写同区域的百炼 Workspace ID。
-- OpenAI：`OPENAI_API_KEY`。
-- 可选声纹：`TENCENT_SECRET_ID` 与 `TENCENT_SECRET_KEY`。声纹音频会按用户显式启用发送到腾讯云说话人验证服务；插件只持久化腾讯云返回的不透明 VoicePrintId，不持久化录音或声纹特征。
-
-插件设置只保存 provider、Workspace ID、ASR/TTS 模型、TTS 音色、VAD/语段合并/草稿停留参数、声纹开关/阈值和播报风格；不保存 Key。声纹 ID 只存 Host 设置且不会返回浏览器，原始 PCM 仅在当前 utterance 的内存中短暂存在。千问默认使用北京区、`qwen3-asr-flash-realtime`、`qwen3-tts-flash-realtime` 和 `Chelsie`；OpenAI 默认使用 `gpt-realtime-2.1` 和 `marin`。`Tina` 是 Omni 专属音色，独立 TTS 不支持；`Chelsie` 是专用 TTS 中更接近其软糯亲昵风格的选择。
-
-## 桌面版 rc.5 的麦克风限制
-
-当前 DeepSeek Harness Desktop rc.5 的 Electron 壳会拒绝 renderer 的麦克风权限。插件在桌面窗口点击话筒时会用默认外部浏览器打开同一个 loopback Harness 页面；在 Chrome/Edge 中授权麦克风后即可使用。Host、会话和插件仍是同一套 Harness 实例，不会接入 Sophie 或另起 Agent 服务。
-
-未来桌面壳开放麦克风权限后，这个插件无需音频架构变更即可直接在内嵌窗口工作。
-
-## 开发与验收
-
-```bash
-npm install --ignore-scripts
-npm run dev:link-dsh
-npm run check
-```
-
-`npm run check` 包含类型检查、无真实 Key 的 Host/委派/双 provider 协议测试、生产构建和浏览器 bundle 纯度检查。
-
-详细 rc.5 契约见 [`docs/HARNESS_RC5_CONTRACT.md`](docs/HARNESS_RC5_CONTRACT.md)。
-
-面向 DSH 组合架构的职责、事件契约、权限边界、依赖和风险清单见 [`docs/ARCHITECTURE_PACKAGE.md`](docs/ARCHITECTURE_PACKAGE.md)。安全报告流程见 [`SECURITY.md`](SECURITY.md)。
-
-自适应“对话接场器”的实现与后续进度话术路线见 [`docs/ADAPTIVE_FLOOR_MANAGER.md`](docs/ADAPTIVE_FLOOR_MANAGER.md)。当前版本已实现第一阶段的实际延迟竞速、单次承接和轨迹重试失效保护。
-
-## 安全边界
-
-- HTTP 与 WebSocket 路由仅接受 loopback、同源请求；百炼 Key 只在 Host 到上游的握手请求中出现。
-- Qwen Workspace ID 和区域使用 allowlist 校验，不能注入任意上游域名。
-- 上游错误最多返回截断后的非敏感文本，不返回凭据。
-- 声纹默认关闭，只支持千问的浏览器 PCM 管线；它只能抑制背景语音自动提交，不能抵御录音重放、合成语音或针对性冒充。
-- OpenAI API 的可用地区和账户使用须遵守其服务条款；插件不实现或配置网络规避功能。
+代码职责和验收场景见 [开发说明](docs/ARCHITECTURE_PACKAGE.md)，数据边界见 [SECURITY.md](SECURITY.md)。

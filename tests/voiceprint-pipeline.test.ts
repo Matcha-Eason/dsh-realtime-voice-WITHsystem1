@@ -15,15 +15,15 @@ interface PipelineInternals {
 }
 
 test('first actionable utterance enrolls but never reaches Harness input', async () => {
-  const transcripts: string[] = []
+  const transcripts: Array<{ text: string; utteranceId?: string; voiceprint?: string }> = []
   const states: string[] = []
   const { connection, internals, restoreFetch } = fixture({ enrolled: true }, {
     onState: (_state, detail) => { if (detail) states.push(detail) },
-    onTranscript: async text => { transcripts.push(text) },
+    onTranscript: async (text, meta) => { transcripts.push({ text, utteranceId: meta?.utteranceId, voiceprint: meta?.voiceprint }) },
   })
   try {
     await utterance(internals, 'enroll-1', '这是我的声纹录入句子')
-    assert.deepEqual(transcripts, [])
+    assert.deepEqual(transcripts, [{ text: '', utteranceId: 'enroll-1', voiceprint: 'unavailable' }])
     assert.equal(internals.voiceprintEnrolled, true)
     assert.equal(states.some(value => value.includes('声纹录入成功')), true)
   } finally {
@@ -72,15 +72,19 @@ test('rejected or unavailable voiceprint always stages text instead of auto-subm
   }
 })
 
-test('filler transcripts are discarded before any voiceprint provider call', async () => {
+test('filler audio is not sent to voiceprint while its final event can resolve a soft pause', async () => {
   let fetches = 0
-  const { connection, internals, restoreFetch } = fixture({ approved: true, score: 99 }, {}, true)
+  const received: Array<{ text: string; voiceprint?: string }> = []
+  const { connection, internals, restoreFetch } = fixture({ approved: true, score: 99 }, {
+    onTranscript: async (text, meta) => { received.push({ text, voiceprint: meta?.voiceprint }) },
+  }, true)
   const previousFetch = globalThis.fetch
   globalThis.fetch = async (...args) => { fetches++; return await previousFetch(...args) }
   try {
     await utterance(internals, 'filler-1', '嗯')
     assert.equal(fetches, 0)
     assert.equal(internals.voiceprintCapture.takeBase64('filler-1'), undefined)
+    assert.deepEqual(received, [{ text: '嗯', voiceprint: 'unavailable' }])
   } finally {
     connection.disconnect()
     globalThis.fetch = previousFetch
@@ -99,7 +103,6 @@ test('a slow voiceprint request never blocks later ASR lifecycle events', async 
   let speechEnds = 0
   const connection = new QwenPipelineConnection(prefs(), {
     onState() {},
-    async onToolCall() {},
     async onTranscript() {},
     onSpeechStart: () => { speechStarts++ },
     onSpeechEnd: () => { speechEnds++ },
@@ -146,7 +149,6 @@ function fixture(
   })
   const connection = new QwenPipelineConnection(prefs(), {
     onState: callbacks.onState ?? (() => {}),
-    onToolCall: callbacks.onToolCall ?? (async () => ({})),
     onTranscript: callbacks.onTranscript,
   })
   const internals = connection as unknown as PipelineInternals

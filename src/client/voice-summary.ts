@@ -1,236 +1,147 @@
-import { VOICE_SUMMARY_END, VOICE_SUMMARY_START } from '../voice-contract.ts'
-
-export { VOICE_SUMMARY_END, VOICE_SUMMARY_START } from '../voice-contract.ts'
-
-const MAX_SUMMARY_WEIGHT = 240
-type StreamMode = 'undecided' | 'lead' | 'legacy'
-
-/**
- * Streams only the first natural paragraph of the final visible answer.
- * Legacy voice-summary comments are accepted for in-flight/older sessions, but
- * new answers need no machine marker and therefore render cleanly in Harness.
- */
+/** Streams the main model's visible prose; code and markup never become speech. */
 export class VoiceSummaryStream {
   private input = ''
-  private pendingSpeech = ''
-  private mode: StreamMode = 'undecided'
-  private ended = false
-  private emitted = false
-  private acceptedWeight = 0
+  private sentence = ''
+  private fence = ''
+  private comment = false
+  private received = false
+  private finished = false
 
   constructor(private readonly emit: (sentence: string) => void) {}
 
   push(delta: string): void {
-    if (delta === '' || this.ended) return
+    if (this.finished || delta === '') return
+    this.received = true
     this.input += delta
-    if (this.mode === 'undecided') {
-      const normalized = normalizeSummaryMarkers(this.input)
-      const legacyStart = normalized.indexOf(VOICE_SUMMARY_START)
-      if (legacyStart >= 0) {
-        this.mode = 'legacy'
-        this.input = normalized.slice(legacyStart + VOICE_SUMMARY_START.length)
-      } else if (couldBeLegacyPrefix(this.input)) {
-        return
-      } else {
-        this.mode = 'lead'
-        this.input = this.input.trimStart()
-        if (isUnsafeLead(this.input)) {
-          this.input = ''
-          this.ended = true
-          return
-        }
-      }
-    }
-    if (this.mode === 'legacy') this.drainLegacy()
-    else this.drainLead(false)
+    this.drain(false)
   }
 
   finish(finalText: string): void {
-    if (!this.ended) {
-      if (this.mode === 'undecided') {
-        const fallback = extractVoiceSummary(finalText)
-        if (fallback !== '') this.emitSpeech(fallback)
-        this.ended = true
-        return
+    if (this.finished) return
+    if (!this.received) this.input = finalText
+    this.drain(true)
+    this.flush()
+    this.finished = true
+  }
+
+  private drain(final: boolean): void {
+    while (this.input !== '') {
+      if (this.fence !== '') {
+        const end = this.input.indexOf('\n')
+        if (end < 0 && !final) return
+        const line = end < 0 ? this.input : this.input.slice(0, end)
+        this.input = end < 0 ? '' : this.input.slice(end + 1)
+        const marker = line.trim()
+        if (marker.length >= this.fence.length && [...marker].every(char => char === this.fence[0])) this.fence = ''
+        continue
       }
-      if (this.mode === 'legacy') this.drainLegacy()
-      else this.drainLead(true)
-    }
-    if (this.pendingSpeech.trim() !== '') this.emitSpeech(this.pendingSpeech)
-    this.pendingSpeech = ''
-    if (!this.emitted) {
-      const fallback = extractVoiceSummary(finalText)
-      if (fallback !== '') this.emitSpeech(fallback)
-    }
-  }
-
-  private drainLead(final: boolean): void {
-    const separator = paragraphBoundary(this.input)
-    if (separator !== undefined) {
-      this.accept(this.input.slice(0, separator.index), true)
-      this.input = ''
-      this.ended = true
-      return
-    }
-    if (final) {
-      this.accept(this.input, true)
-      this.input = ''
-      this.ended = true
-      return
-    }
-    const held = partialParagraphSuffixLength(this.input)
-    const safeLength = this.input.length - held
-    if (safeLength <= 0) return
-    this.accept(this.input.slice(0, safeLength), false)
-    this.input = this.input.slice(safeLength)
-  }
-
-  private drainLegacy(): void {
-    this.input = normalizeSummaryMarkers(this.input)
-    const end = this.input.indexOf(VOICE_SUMMARY_END)
-    if (end >= 0) {
-      this.accept(this.input.slice(0, end), true)
-      this.input = ''
-      this.ended = true
-      return
-    }
-    const held = Math.max(
-      partialMarkerSuffixLength(this.input, VOICE_SUMMARY_END),
-      partialHtmlCommentSuffixLength(this.input),
-    )
-    const safeLength = this.input.length - held
-    if (safeLength <= 0) return
-    this.accept(this.input.slice(0, safeLength), false)
-    this.input = this.input.slice(safeLength)
-  }
-
-  private accept(text: string, flush: boolean): void {
-    const remaining = MAX_SUMMARY_WEIGHT - this.acceptedWeight
-    if (remaining <= 0) {
-      if (flush && this.pendingSpeech.trim() !== '') {
-        this.emitSpeech(this.pendingSpeech)
-        this.pendingSpeech = ''
+      if (this.comment) {
+        const end = this.input.indexOf('-->')
+        if (end < 0) {
+          this.input = final ? '' : this.input.slice(-2)
+          return
+        }
+        this.input = this.input.slice(end + 3)
+        this.comment = false
+        continue
       }
-      return
-    }
-    const bounded = takeWeighted(text, remaining)
-    this.acceptedWeight += speechWeight(bounded)
-    this.pendingSpeech += bounded
-
-    let boundary = completedSentenceBoundary(this.pendingSpeech)
-    while (boundary > 0) {
-      const sentence = this.pendingSpeech.slice(0, boundary)
-      this.pendingSpeech = this.pendingSpeech.slice(boundary)
-      this.emitSpeech(sentence)
-      boundary = completedSentenceBoundary(this.pendingSpeech)
-    }
-    if (flush && this.pendingSpeech.trim() !== '') {
-      this.emitSpeech(this.pendingSpeech)
-      this.pendingSpeech = ''
+      if (!final && ['<', '<!', '<!-', '!', '`', '``', '~', '~~'].includes(this.input)) return
+      if (this.input.startsWith('<!--')) {
+        this.input = this.input.slice(4)
+        this.comment = true
+        continue
+      }
+      const fence = /^(`{3,}|~{3,})/.exec(this.input)
+      if (fence !== null) {
+        const end = this.input.indexOf('\n')
+        if (end < 0) {
+          if (final) this.input = ''
+          return
+        }
+        this.flush()
+        this.fence = fence[0]
+        this.input = this.input.slice(end + 1)
+        continue
+      }
+      // Hold a protected span until complete: punctuation inside a URL, tag or
+      // inline code must not split it and leak its Markdown into an audio chunk.
+      if (/^<\/?[a-z]/iu.test(this.input)) {
+        const end = this.input.indexOf('>')
+        if (end < 0) { if (final) this.input = ''; return }
+        this.input = this.input.slice(end + 1)
+        continue
+      }
+      if (this.input.startsWith('`')) {
+        const marker = this.input.startsWith('``') ? '``' : '`'
+        const end = this.input.indexOf(marker, marker.length)
+        if (end < 0 && !final) return
+        this.accept(this.input.slice(marker.length, end < 0 ? undefined : end))
+        this.input = end < 0 ? '' : this.input.slice(end + marker.length)
+        continue
+      }
+      if (/^!?\[/u.test(this.input)) {
+        const start = this.input.startsWith('!') ? 2 : 1
+        const labelEnd = this.input.indexOf(']', start)
+        if (labelEnd < 0 || (labelEnd === this.input.length - 1 && !final)) {
+          if (!final) return
+        } else if (this.input[labelEnd + 1] === '(') {
+          let depth = 1
+          let end = labelEnd + 2
+          for (; end < this.input.length && depth > 0; end++) {
+            if (this.input[end] === '(') depth++
+            if (this.input[end] === ')') depth--
+          }
+          if (depth > 0 && !final) return
+          this.accept(this.input.slice(start, labelEnd))
+          this.input = depth > 0 ? '' : this.input.slice(end)
+          continue
+        }
+      }
+      const next = /[`<\[!~\n]/u.exec(this.input.slice(1))
+      const length = next === null ? this.input.length : next.index + 1
+      if (this.input[0] === '\n') {
+        this.flush()
+        this.input = this.input.slice(1)
+      } else {
+        this.accept(this.input.slice(0, length))
+        this.input = this.input.slice(length)
+      }
     }
   }
 
-  private emitSpeech(text: string): void {
-    const clean = cleanSpeechText(text)
-    if (clean === '') return
-    this.emitted = true
-    this.emit(clean)
+  private accept(text: string): void {
+    this.sentence += text
+    // English periods need following whitespace so a streamed decimal such as
+    // "3." + "14" is not prematurely spoken as a complete sentence.
+    let boundary = /[。！？!?；;]+[”’」』】）)]*|\.(?=\s)/u.exec(this.sentence)
+    while (boundary !== null) {
+      const end = boundary.index + boundary[0].length
+      const complete = this.sentence.slice(0, end)
+      this.sentence = this.sentence.slice(end)
+      this.speak(complete)
+      boundary = /[。！？!?；;]+[”’」』】）)]*|\.(?=\s)/u.exec(this.sentence)
+    }
+  }
+
+  private flush(): void {
+    this.speak(this.sentence)
+    this.sentence = ''
+  }
+
+  private speak(text: string): void {
+    const clean = text
+      .replace(/^\s*(?:#{1,6}\s+|>\s*|[-+*]\s+|\d+[.)、]\s*)/u, '')
+      .replace(/\*+/gu, '')
+      .replace(/(?<!\w)_{1,2}|_{1,2}(?!\w)/gu, '')
+      .replace(/[\[\]`~]/gu, '')
+      .replace(/\s+/gu, ' ')
+      .trim()
+    if (clean !== '') this.emit(clean)
   }
 }
 
 export function extractVoiceSummary(text: string): string {
-  const normalized = normalizeSummaryMarkers(text)
-  const start = normalized.indexOf(VOICE_SUMMARY_START)
-  if (start >= 0) {
-    const bodyStart = start + VOICE_SUMMARY_START.length
-    const end = normalized.indexOf(VOICE_SUMMARY_END, bodyStart)
-    if (end < 0) return ''
-    return cleanSpeechText(takeWeighted(normalized.slice(bodyStart, end), MAX_SUMMARY_WEIGHT))
-  }
-  const body = text.trimStart()
-  if (body === '' || isUnsafeLead(body)) return ''
-  const separator = paragraphBoundary(body)
-  const lead = separator === undefined ? body : body.slice(0, separator.index)
-  if (/<!--|-->/u.test(lead)) return ''
-  return cleanSpeechText(takeWeighted(lead, MAX_SUMMARY_WEIGHT))
-}
-
-function normalizeSummaryMarkers(text: string): string {
-  return text
-    .replace(/<!--\s*voice-summary\s*-->/gi, VOICE_SUMMARY_START)
-    .replace(/<!--\s*\/voice-summary\s*-->/gi, VOICE_SUMMARY_END)
-}
-
-function couldBeLegacyPrefix(text: string): boolean {
-  const trimmed = text.trimStart()
-  if (trimmed === '') return true
-  return '<!-- voice-summary -->'.startsWith(trimmed.toLowerCase())
-    || '<!--voice-summary-->'.startsWith(trimmed.toLowerCase())
-}
-
-function isUnsafeLead(text: string): boolean {
-  return /^(?:`|<!--|<|\{|\[|#|\*|>|-|\+\s|\d+[.、)]|\||[•·])/u.test(text.trimStart())
-}
-
-function paragraphBoundary(text: string): { index: number; length: number } | undefined {
-  const match = /\r?\n[\t ]*\r?\n/u.exec(text)
-  if (match === null || match.index === undefined) return undefined
-  return { index: match.index, length: match[0].length }
-}
-
-function partialParagraphSuffixLength(text: string): number {
-  const match = /\r?\n[\t ]*$/u.exec(text)
-  return match === null ? 0 : match[0].length
-}
-
-function completedSentenceBoundary(text: string): number {
-  const match = /[。！？!?；;](?:[”’」』】）)])?/u.exec(text)
-  if (match === null || match.index === undefined) return 0
-  return match.index + match[0].length
-}
-
-function cleanSpeechText(text: string): string {
-  return text
-    .replace(/```[\s\S]*?```/g, ' ')
-    .replace(/<!--[\s\S]*?-->/g, ' ')
-    .replace(/<\/?[^>]+>/g, ' ')
-    .replace(/`([^`]+)`/g, '$1')
-    .replace(/!??\[([^\]]*)\]\([^)]*\)/g, '$1')
-    .replace(/^#{1,6}\s+/gm, '')
-    .replace(/[>*_~]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-}
-
-function partialHtmlCommentSuffixLength(text: string): number {
-  const open = text.lastIndexOf('<!--')
-  if (open >= 0 && text.indexOf('-->', open + 4) < 0) return text.length - open
-  for (const prefix of ['<!-', '<!', '<']) if (text.endsWith(prefix)) return prefix.length
-  return 0
-}
-
-function partialMarkerSuffixLength(text: string, marker: string): number {
-  const max = Math.min(text.length, marker.length - 1)
-  for (let length = max; length > 0; length--) {
-    if (text.endsWith(marker.slice(0, length))) return length
-  }
-  return 0
-}
-
-function takeWeighted(text: string, limit: number): string {
-  let weight = 0
-  let result = ''
-  for (const char of text) {
-    const next = speechWeight(char)
-    if (weight + next > limit) break
-    result += char
-    weight += next
-  }
-  return result
-}
-
-function speechWeight(text: string): number {
-  let value = 0
-  for (const char of text) value += /[\u3400-\u9fff\uf900-\ufaff]/u.test(char) ? 2 : 1
-  return value
+  const spoken: string[] = []
+  new VoiceSummaryStream(sentence => spoken.push(sentence)).finish(text)
+  return spoken.join(' ')
 }

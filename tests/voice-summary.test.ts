@@ -1,64 +1,65 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { extractVoiceSummary, VoiceSummaryStream } from '../src/client/voice-summary.ts'
-import { VOICE_OUTPUT_CONTEXT } from '../src/voice-contract.ts'
 
-test('streams complete sentences from the first natural paragraph only', () => {
+test('speaks every paragraph as sentences arrive, without waiting for turn completion', () => {
   const spoken: string[] = []
   const stream = new VoiceSummaryStream(sentence => spoken.push(sentence))
-  for (const delta of ['天气晴朗。', '出门不用带伞', '。\n', '\n详细结果不会播。']) stream.push(delta)
-  stream.finish('')
-  assert.deepEqual(spoken, ['天气晴朗。', '出门不用带伞。'])
+  stream.push('天气晴朗。')
+  assert.deepEqual(spoken, ['天气晴朗。'])
+  for (const delta of ['出门不用带伞', '。\n', '\n晚上会降温。']) stream.push(delta)
+  stream.finish('天气晴朗。出门不用带伞。\n\n晚上会降温。')
+  assert.deepEqual(spoken, ['天气晴朗。', '出门不用带伞。', '晚上会降温。'])
 })
 
-test('a simple one-paragraph answer is flushed at turn completion', () => {
+test('flushes an unpunctuated ending exactly once and ignores late deltas', () => {
   const spoken: string[] = []
   const stream = new VoiceSummaryStream(sentence => spoken.push(sentence))
   stream.push('可以，已经处理好了')
   stream.finish('可以，已经处理好了')
+  stream.finish('可以，已经处理好了')
+  stream.push('迟到的文字。')
   assert.deepEqual(spoken, ['可以，已经处理好了'])
 })
 
-test('leading blank lines do not consume the first natural paragraph', () => {
-  const spoken: string[] = []
-  const stream = new VoiceSummaryStream(sentence => spoken.push(sentence))
-  stream.push('\n\n')
-  stream.push('这是实际结论。\n\n详细内容。')
-  stream.finish('')
-  assert.deepEqual(spoken, ['这是实际结论。'])
+test('uses the completed answer when the transport provided no text deltas', () => {
+  assert.equal(extractVoiceSummary('第一段。\n\n第二段没有句号'), '第一段。 第二段没有句号')
+  const long = `${'这是完整回答的一部分。'.repeat(40)}最后一句。`
+  assert.equal(extractVoiceSummary(long).replaceAll(' ', ''), long)
 })
 
-test('legacy complete markers remain supported for in-flight sessions', () => {
+test('discards fenced code across arbitrary chunk boundaries and resumes following prose', () => {
+  const response = '先安装依赖。\n```sh\necho "不能朗读！"\n```\n然后启动程序。\n~~~js\nthrow new Error("也不读。");\n~~~\n完成。'
   const spoken: string[] = []
   const stream = new VoiceSummaryStream(sentence => spoken.push(sentence))
-  for (const delta of ['<!-- voice-', 'summary -->已经成功了。<!--', ' /voice-summary -->详细结果']) stream.push(delta)
-  stream.finish('')
-  assert.deepEqual(spoken, ['已经成功了。'])
+  for (const char of response) stream.push(char)
+  stream.finish(response)
+  assert.deepEqual(spoken, ['先安装依赖。', '然后启动程序。', '完成。'])
 })
 
-test('legacy closing comments split across chunks never leak into TTS', () => {
+test('unfinished code and comments do not leak or reappear through final-text fallback', () => {
+  assert.equal(extractVoiceSummary('```json\n{"result":"不朗读。"}'), '')
+  assert.equal(extractVoiceSummary('<!-- 不朗读。'), '')
   const spoken: string[] = []
   const stream = new VoiceSummaryStream(sentence => spoken.push(sentence))
-  for (const delta of ['<!-- voice-summary -->结果已经完成。<!--', ' /', 'voice', '-summary', ' -->详细内容']) stream.push(delta)
-  stream.finish('')
-  assert.deepEqual(spoken, ['结果已经完成。'])
-  assert.equal(spoken.some(text => /voice|summary|<!--|-->/i.test(text)), false)
-})
-
-test('unsafe machine-shaped first content fails closed', () => {
-  assert.equal(extractVoiceSummary('```json\n{"result":true}\n```'), '')
-  assert.equal(extractVoiceSummary('<!-- broken comment'), '')
-  const spoken: string[] = []
-  const stream = new VoiceSummaryStream(sentence => spoken.push(sentence))
-  stream.push('{"type":"callout"}')
-  stream.finish('{"type":"callout"}')
+  stream.push('```json\n{"result":"不朗读。"}')
+  stream.finish('```json\n{"result":"不朗读。"}')
   assert.deepEqual(spoken, [])
 })
 
-test('voice context requires a clean first paragraph and forbids marker output', () => {
-  assert.match(VOICE_OUTPUT_CONTEXT, /第一自然段就是可直接播报的口语开场/)
-  assert.match(VOICE_OUTPUT_CONTEXT, /第一段后空一行/)
-  assert.match(VOICE_OUTPUT_CONTEXT, /不要输出任何 HTML 注释/)
-  assert.match(VOICE_OUTPUT_CONTEXT, /最终回答之前不要输出任何可见正文/)
-  assert.doesNotMatch(VOICE_OUTPUT_CONTEXT, /内容严格为 voice-summary/)
+test('strips split comments, headings and link destinations while preserving their prose', () => {
+  const response = '<!-- old marker -->\n# 配置方法\n1. 打开[设置](https://example.com/a?q=yes!#section)。\n- 选择 **语音模式**。\n<!-- /old marker -->后续内容。'
+  const spoken: string[] = []
+  const stream = new VoiceSummaryStream(sentence => spoken.push(sentence))
+  for (let i = 0; i < response.length; i += 2) stream.push(response.slice(i, i + 2))
+  stream.finish(response)
+  assert.deepEqual(spoken, ['配置方法', '打开设置。', '选择 语音模式。', '后续内容。'])
+})
+
+test('inline code keeps its text and English decimals survive split chunks', () => {
+  const spoken: string[] = []
+  const stream = new VoiceSummaryStream(sentence => spoken.push(sentence))
+  for (const delta of ['Use `foo_', 'bar` with 3.', '14. Then continue', '.']) stream.push(delta)
+  stream.finish('')
+  assert.deepEqual(spoken, ['Use foo_bar with 3.14.', 'Then continue.'])
 })

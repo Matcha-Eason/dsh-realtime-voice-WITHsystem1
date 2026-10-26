@@ -1,21 +1,11 @@
-# Security Policy
+# Security boundaries
 
-## Supported versions
+- Provider keys are resolved on the Harness Host. `.env.local` is a local development credential file and is excluded from Git and the package. Keys must not enter browser storage, plugin settings, logs, screenshots, or reports.
+- HTTP and WebSocket bridges accept loopback, same-origin requests. Upstream endpoint selection is allowlisted.
+- While voice mode is enabled, microphone audio goes to the selected ASR service. The Token Plan HTTP adapter sends growing preview windows and final utterances; audio stays in memory rather than being recorded to disk.
+- The decision provider receives the transcript, conversation activity flags, and recent visible assistant text. The main model receives the native DSH conversation. TTS receives visible answer text, excluding reasoning and tool payloads.
+- All spoken text comes from the current main model. Decision responses are restricted to actions and revisions. The plugin does not bypass Harness tool approval or authorization policies.
+- Optional Tencent voiceprint support is off by default. When explicitly enabled, utterance PCM is sent to Tencent for enrollment or verification; only the opaque provider identifier is persisted. Voiceprint is an interference signal, not identity authentication. The current minimal settings UI does not expose enrollment management.
+- Local development uses an isolated DSH profile under `.local/`. Do not publish that directory, credential files, private transcripts, or local authorization URLs.
 
-Security fixes are applied to the latest tagged release. Please upgrade before reporting an issue that is already fixed on `main`.
-
-## Reporting a vulnerability
-
-Please use GitHub's private vulnerability reporting for this repository. Do not open a public issue containing API keys, Workspace IDs, session transcripts, local Harness URLs, or credential files.
-
-Include the affected version, provider, reproduction steps, impact, and a minimal redacted trace. We will acknowledge a complete report as soon as practical and coordinate disclosure after a fix is available.
-
-## Security boundaries
-
-- Provider keys are resolved only by the Harness Host credential service and must never enter browser storage, plugin settings, logs, screenshots, or bug reports.
-- HTTP and WebSocket bridges accept loopback same-origin requests only; provider region and endpoint selection are allowlisted.
-- ASR text is submitted to the active Harness session. TTS receives only the first visible answer paragraph, never reasoning blocks or tool payloads.
-- Optional voiceprint gating is off by default. When explicitly enabled, 16kHz mono PCM for one utterance is sent to Tencent Cloud for enrollment or verification; raw audio and embeddings are not persisted. Only the opaque provider identifier is stored on the Host and it is never returned to the browser.
-- Voiceprint is an interference-reduction signal, not authentication or authorization. A rejection or provider failure prevents automatic submission but preserves the transcript for deliberate manual sending. High-risk actions still require Harness policy and user confirmation.
-- AI dynamic floor speech sends only a Host-sanitized topic of at most 18 characters, a closed stage enum, and up to three prior validated cues to the selected voice provider. It never sends the original prompt, Harness reasoning, tool payloads, or credentials through the composer route.
-- The plugin does not bypass provider geography, account policy, or user consent requirements.
+Report vulnerabilities privately to the repository maintainer. Include a redacted reproduction and affected commit; never include a live API key or private recording. This development fork does not promise a release support schedule.

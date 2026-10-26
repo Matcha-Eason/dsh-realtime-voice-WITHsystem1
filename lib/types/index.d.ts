@@ -2,8 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Duplex } from 'node:stream';
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
 import z from '@deepseek-ai/schemastery';
-import { type SignalRequest } from './host/signaling.ts';
-import { composeFloorText } from './host/floor-composer.ts';
+import { decideTurn } from './host/turn-decision.ts';
 export declare const name = "dsh-realtime-voice";
 export declare const inject: string[];
 interface CredentialService {
@@ -66,17 +65,14 @@ interface HostContext {
     };
 }
 export interface HostDependencies {
-    exchangeOpenAi(request: SignalRequest, key: string, signal: AbortSignal): Promise<string>;
-    exchangeQwen(request: SignalRequest, key: string, signal: AbortSignal): Promise<string>;
+    decideTurn: typeof decideTurn;
     voiceprintEnroll(audio: string, secretId: string, secretKey: string, signal: AbortSignal): Promise<string>;
     voiceprintVerify(audio: string, voiceprintId: string, secretId: string, secretKey: string, signal: AbortSignal): Promise<{
         decision: boolean;
         score: number;
     }>;
     voiceprintDelete(voiceprintId: string, secretId: string, secretKey: string, signal: AbortSignal): Promise<void>;
-    composeFloor(input: Parameters<typeof composeFloorText>[0], key: string, signal: AbortSignal): Promise<string>;
 }
 export declare function apply(ctx: HostContext, dependencies?: HostDependencies): void;
 export declare function isHostDependencies(value: unknown): value is HostDependencies;
 export { isLoopbackRequest, readJsonBody } from './host/security.ts';
-export { normalizeSdp, parseSignalRequest, qwenEndpoint } from './host/signaling.ts';

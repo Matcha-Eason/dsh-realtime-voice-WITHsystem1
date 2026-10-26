@@ -21,28 +21,26 @@ export declare class QwenPipelineConnection {
     private speechAudible;
     private currentSpeechText;
     private inputPhase;
-    private readonly bargeInGate;
-    private bargeInCandidate;
-    private bargeInTimer?;
-    private ttsStartedAt;
-    private ttsInterruptedForBargeIn;
     private speechEpoch;
+    private pendingSpeechText;
+    private pendingSpeechHasAudio;
     private asrEventTail;
-    private readonly quarantinedItems;
-    private readonly ignoredItems;
+    private activeUtteranceId?;
+    private nextUtteranceId;
     private readonly utteranceBusy;
-    private asrRestarting;
-    private asrContaminated;
+    private readonly utteranceSpeech;
+    private readonly completedUtterances;
     private readonly voiceprintCapture;
     private voiceprintDispatchTail;
     private voiceprintEpoch;
-    private readonly voiceprintHandledItems;
     private voiceprintConfigured;
     private voiceprintEnrolled;
     constructor(prefs: VoicePrefs, callbacks: RealtimeCallbacks);
     connect(): Promise<void>;
     speak(text: string): Promise<void>;
     waitForSpeechIdle(): Promise<void>;
+    pauseSpeech(): void;
+    resumeSpeech(): void;
     cancelSpeech(): void;
     setInputPhase(phase: TurnPhase): void;
     disconnect(): void;
@@ -51,30 +49,12 @@ export declare class QwenPipelineConnection {
     private startCapture;
     private handleAsr;
     private handleTts;
-    private isTtsActive;
-    private interruptTts;
-    private rejectFalseBargeIn;
-    private resetBargeIn;
     private appendAsr;
     private beginVoiceprintCheck;
     private dispatchVoiceprintTranscript;
-    private restartAsr;
     private sendAsr;
     private sendTts;
 }
 export declare function isLikelyTtsEcho(transcript: string, speech: string): boolean;
-export declare class LocalBargeInGate {
-    private noiseFloor;
-    private activeMs;
-    private candidate;
-    private bufferedMs;
-    private frames;
-    observe(pcm: Int16Array): void;
-    push(pcm: Int16Array, playbackElapsedMs: number): {
-        forward: boolean;
-        preRoll: Int16Array[];
-    };
-    reset(): void;
-}
 /** Keep only speakable prose and stay below Qwen's weighted text limit. */
 export declare function splitForTts(text: string, maxWeight?: number): string[];

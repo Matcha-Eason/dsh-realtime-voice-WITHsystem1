@@ -1,7 +1,7 @@
 {
   "name": "dsh-realtime-voice",
-  "version": "0.12.0",
-  "description": "Lightweight realtime speech-to-speech for DeepSeek Harness with Qwen and OpenAI providers.",
+  "version": "0.13.0",
+  "description": "Main-model voice conversation for DeepSeek Harness with semantic turn decisions and bidirectional interruption.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -32,7 +32,8 @@
     "client": {
       "platform": "web",
       "inject": [
-        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-api-session-controller",
         "@deepseek-ai/dsh-client-ui-conversation",
         "@deepseek-ai/dsh-client-ui-settings",
         "@deepseek-ai/dsh-client-ui-settings-plugins"
@@ -49,25 +50,29 @@
     "test:client-bundle": "node scripts/check-client-bundle.mjs",
     "check": "npm run typecheck && npm test && npm run build && npm run test:client-bundle",
     "dev:link-dsh": "node scripts/link-dsh-app.mjs",
-    "prepack": "npm run build"
+    "dev:dsh": "node scripts/dev-dsh.mjs",
+    "prepack": "npm run build",
+    "check:bailian": "node --env-file=.env.local scripts/check-bailian.mjs"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": ">=4.0.1-rc.1 <4.1.0",
-    "@deepseek-ai/dsh-client-runtime": ">=0.1.0-rc.3 <0.2.0",
-    "@deepseek-ai/dsh-client-ui-conversation": ">=0.1.0-rc.3 <0.2.0",
-    "@deepseek-ai/dsh-client-ui-settings": ">=0.1.0-rc.3 <0.2.0",
-    "@deepseek-ai/dsh-client-ui-settings-plugins": ">=0.1.0-rc.3 <0.2.0",
-    "@deepseek-ai/dsh-client-ui-slots": ">=0.1.0-rc.3 <0.2.0",
-    "@deepseek-ai/dsh-credentials": ">=0.1.0-rc.3 <0.2.0",
-    "@deepseek-ai/schemastery": ">=4.0.1 <5.0.0",
+    "@deepseek-ai/cordis": ">=4.0.5 <4.1.0",
+    "@deepseek-ai/dsh-client-ui-conversation": ">=0.2.1-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-client-ui-settings": ">=0.2.1-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-client-ui-settings-plugins": ">=0.2.1-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-client-ui-slots": ">=0.2.1-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-credentials": ">=0.2.1-rc.2 <0.3.0",
+    "@deepseek-ai/schemastery": ">=3.18.5 <4.0.0",
     "react": "^18.2.0",
-    "react-dom": "^18.2.0"
+    "react-dom": "^18.2.0",
+    "@deepseek-ai/dsh-client-connection": ">=0.2.1-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-api-session-controller": ">=0.2.1-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-client-ui-renderer": ">=0.2.1-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-agent": ">=0.2.1-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-session": ">=0.2.1-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-client-store": ">=0.2.1-rc.2 <0.3.0"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/cordis": {
-      "optional": true
-    },
-    "@deepseek-ai/dsh-client-runtime": {
       "optional": true
     },
     "@deepseek-ai/dsh-client-ui-conversation": {
@@ -82,16 +87,34 @@
     "@deepseek-ai/dsh-client-ui-slots": {
       "optional": true
     },
-    "@deepseek-ai/schemastery": {
+    "@deepseek-ai/dsh-credentials": {
       "optional": true
     },
-    "@deepseek-ai/dsh-credentials": {
+    "@deepseek-ai/schemastery": {
       "optional": true
     },
     "react": {
       "optional": true
     },
     "react-dom": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-connection": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-api-session-controller": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-ui-renderer": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-agent": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-session": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-store": {
       "optional": true
     }
   },
@@ -109,11 +132,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zfu691531-hash/dsh-realtime-voice.git"
+    "url": "git+ssh://git@github.com/Matcha-Eason/dsh-realtime-voice-WITHsystem1.git"
   },
-  "homepage": "https://github.com/zfu691531-hash/dsh-realtime-voice#readme",
+  "homepage": "https://github.com/Matcha-Eason/dsh-realtime-voice-WITHsystem1#readme",
   "bugs": {
-    "url": "https://github.com/zfu691531-hash/dsh-realtime-voice/issues"
+    "url": "https://github.com/Matcha-Eason/dsh-realtime-voice-WITHsystem1/issues"
   },
   "keywords": [
     "deepseek-harness",
@@ -123,7 +146,7 @@
     "asr",
     "tts",
     "qwen",
-    "openai"
+    "system1"
   ],
   "dependencies": {
     "ws": "^8.21.3"

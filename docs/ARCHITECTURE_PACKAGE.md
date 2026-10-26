@@ -1,97 +1,46 @@
-# Realtime Voice Architecture Package
+# 开发说明
 
-This document is the handoff contract for the wider DSH plugin composition.
+## 职责
 
-## Repository and release identity
+| 文件 | 持有的行为与边界 |
+|---|---|
+| `src/client/controller.ts` | 输入草稿所有权、转写修订、轮次动作、主模型输出、插话候选生命周期 |
+| `src/client/harness-delegate.ts` | 原生 Session retain / binding、提交、事件观察、定向取消 |
+| `src/client/qwen-pipeline.ts` | 麦克风与 ASR 连接、PCM 播放、暂停/恢复/取消、音频代际 |
+| `src/client/voice-summary.ts` | 可见正文的流式分句与 Markdown / 代码过滤 |
+| `src/turn-decision.ts` | 决策输入、动作、修订号的数据约定 |
+| `src/host/turn-decision.ts` | SystemOne 请求、超时和结果校验 |
+| `src/host/qwen-inference.ts` | Token Plan TTS inference 协议与 HTTP ASR 窗口调度 |
+| `src/host/qwen-speech-proxy.ts` | 语音连接、服务选择和 Host 凭据边界 |
+| `src/index.ts` | 同源路由、设置、当前会话的临时口语输出指令 |
 
-- Repository: <https://github.com/zfu691531-hash/dsh-realtime-voice>
-- Default branch: `main`
-- Release line: `0.12.x`
-- Current release candidate: `v0.12.0`
-- Released commit: recorded by the immutable `v0.12.0` tag after release publication
+不再另设全局轮次协调器或接场模型。控制器管理文本轮次；音频连接管理设备和播放资源；原生会话桥管理 DSH 提交与取消。
 
-The exact released commit is recorded by the immutable Git tag and GitHub Release. Do not duplicate this repository or rewrite its history.
+## 数据路径
 
-## Responsibility and non-goals
+麦克风 PCM → 本地 Host ASR 代理 → 转写修订 → 轮次判断 → 原生输入框 / DSH Session → 主模型可见回答 → 分句 → Host TTS 代理 → PCM 播放。
 
-The plugin owns microphone capture, endpointing, ASR transport, optional speaker-interference soft gating, native Harness input submission, trace observation, turn/floor coordination, first-paragraph extraction, TTS transport, playback, and guarded barge-in.
+决策只返回 `wait`、`submit`、`backchannel`、`interrupt`、`interject` 或 `cancel` 与对应修订号。它看到转写、用户/助手发言状态、主模型忙闲和近期助手正文，不生成播报内容。
 
-It does not own reasoning, memory, web/app tools, business actions, cross-agent collaboration, gesture recognition, or a second conversational model. Harness remains the only reasoning and tool scheduler and the only writer of official conversation history.
+用户起声时先暂停音频。确认接管话轮后丢弃未播内容；确认附和后恢复。新转写或新 utterance 会使尚未播出的主动澄清候选过期。开始播放与生成完成分开处理，旧连接或旧输出的回调不能复活已取消音频。
 
-## Runtime chain
+语音模式以当前 session ID 向 Host 注册临时口语上下文，并带上完整播出的片段和被打断状态。它不改写 DSH 历史，也不声称用户听完已生成但未播放的文本。
 
-```text
-Microphone → Qwen streaming ASR → native Harness composer/session
-           → Harness reasoning + installed plugins/tools
-           → assistant text-delta first paragraph → Qwen streaming TTS → speaker
-```
+## 验收
 
-The optional OpenAI route uses the provider Realtime transport, but its mandatory delegation tool still routes task reasoning through Harness. The deterministic Qwen ASR → Harness → Qwen TTS route is the primary compatibility baseline.
+自动测试覆盖以下关键场景：
 
-## Audio, preemption, and trace contract
+- “我想订……不，改成下周”不会在中间片段自动发送。
+- 手工编辑或清空草稿后，迟到转写不能替用户发送该草稿。
+- “嗯”触发暂停后可恢复；真正接管话轮会丢弃旧音频；明确取消才取消本插件对应任务。
+- 旧决策、重试旧 TTS 的取消异常、旧 socket 音频均不能影响新输出。
+- 用户继续说话会撤销尚未播放的澄清；起声、final 和 HTTP ASR 时序不能误提交旧句。
+- 关闭时仍未完成的麦克风授权会释放迟到的音轨，不再连接后续服务。
 
-- ASR finals merge across the configured continuation window; idle/empty composer input auto-submits, while speech captured during Harness/TTS appends to the native draft under an ASR-only lease. The lease can submit the whole draft only after Harness/TTS returns to listening and the configured dwell expires.
-- `speech_started` pauses the dwell before a final transcript exists. Only `speech_stopped` may arm a bounded no-final grace, so a long utterance cannot be cut by a guessed timeout. A merged final resets the dwell; keyboard edit/paste/clear/manual submit, stale draft/connection, voiceprint failure, explicit cancellation, or sensitive-action wording revokes it.
-- A single `TurnCoordinator` and single-writer TTS queue reject stale generations.
-- Floor timing starts only after the trace confirms a real `user/message` with `source.kind === 'user'`.
-- `assistant/chunk.text-delta` is visible answer text; `reasoning-delta` is ignored.
-- `tool-call-delta`, `block-start(tool-call)`, and `tool/call` invalidate any streamed tool preamble while preserving simple-answer streaming.
-- The floor manager dynamically composes bounded local cues from a sanitized task topic, intent, tool/retry stage, and per-turn deduplication. These cues share the result TTS queue and never become Harness messages.
-- `llm/retry` and `llm/retry-started` invalidate queued/in-flight speech. Qwen `speechEpoch` also closes the TTS-ready race.
-- `turn/end(completed)` finishes playback; aborted/interrupted/blocked/error/max-tokens paths cancel or fail without inventing an answer.
-- Only explicit cancel phrases cancel an active Harness task. General barge-in stages text in the native composer.
+人工验收还需覆盖：耳机连续对话、外放回声、长句与口音、噪声中的误打断、网络变慢、工具执行期间补充信息。记录从尾静音到最终转写、决策、主模型首文字、TTS 首音频及实际播放的时间，分别优化，避免仅用首 token 代替体感延迟。
 
-## Data and permission boundary
+## 开发约束
 
-- Browser: microphone PCM, a bounded in-memory voiceprint utterance buffer when explicitly enabled, ephemeral provider audio, transcript drafts, non-secret preferences.
-- Harness Host: credential resolution, same-origin signaling/WebSocket proxy, active voice-context TTL, and an optional opaque Tencent VoicePrintId. The ID is not returned to the browser.
-- Provider: audio/text required by the selected ASR or TTS request. When voiceprint is enabled, the current 16kHz PCM utterance is also sent to Tencent Cloud for enrollment or verification; raw audio is not persisted by the plugin.
-- Harness session log: user transcript and Harness answer/tool events; local floor cues are never persisted.
-- Required permissions: microphone in an external browser for Desktop rc.5, loopback network access, and the chosen provider credential. No filesystem, app-control, memory, gesture, or MCP permission is requested by this plugin.
-- Voiceprint is a fail-closed auto-submit signal, not authentication: rejected, short, timed-out, or unavailable checks preserve text in the composer for manual sending and never authorize sensitive work.
+使用原生 API，只有拥有生命周期、协议转换或错误处理的边界才保留适配层。决策不能越过草稿修订检查。TTS 不能自行补写、总结或生成答案。主动澄清目前通过主模型提示要求不调用工具，尚无独立的硬性工具隔离。
 
-## Composition dependencies
-
-| Capability | Runtime dependency | Contract |
-|---|---:|---|
-| General communication/app control | No | Installed Harness tools receive the native user turn; voice never calls them directly. |
-| Memory | No | Memory plugins read/write through the same Harness turn and history. Voice stores no independent long-term memory. |
-| Gesture control | No | Gesture and voice are peer local-I/O plugins. Neither may call the other's private runtime; multimodal orchestration belongs to a versioned public DSH capability/event layer. |
-| Collaboration Skill/DSH agents | No | Collaboration remains a Harness/Codex workflow; voice observes the resulting session trace only. |
-| MCP | No | This is a native DSH Host+Client bundle, not an MCP server. MCP tools remain independently installable. |
-
-## Peer I/O baseline: dsh-gesture-mouse v0.1.0
-
-The accepted gesture peer baseline is [dsh-gesture-mouse](https://github.com/zfu691531-hash/dsh-gesture-mouse) at commit `47cc7985b25d340740af9887259c32f4fc6b9b16`, tag `v0.1.0`.
-
-- Its public DSH tools are `gesture_status`, `gesture_start`, `gesture_stop`, and `gesture_test_trigger`.
-- Its Swift Helper reports only `hello`, `state`, `stats`, `error`, and `trigger`; a `trigger` contains only `gestureId`, `confidence`, and `timestamp`.
-- Images and landmarks do not leave the Swift Helper. `autoStart` defaults to `false`; Camera and Accessibility are its minimum permissions.
-- In v0.1.0, external actions are reported only as `planned`, `accepted`, or `ignored`; the gesture plugin does not execute them.
-- Voice must not depend on the gesture plugin's IPC, PID, socket/token, Swift state machine, or internal file layout. Gesture must likewise not depend on voice internals.
-- Any future integration must use a versioned public DSH capability/event adapter owned by the Host or public capability layer. Multimodal orchestration must not be implemented inside either I/O plugin.
-- Gesture confidence is only a sensor signal. It is not identity, authorization, or permission to execute an action.
-
-Real-device Camera/TCC behavior, false-trigger rate, latency, dark/occluded conditions, and formal signing are not yet accepted for the gesture peer. Neither this architecture package nor the voice plugin claims that gesture v0.1.0 is production-ready.
-
-## Verified commands
-
-```bash
-npm install --ignore-scripts
-npm run dev:link-dsh
-npm run check
-npm pack --json
-dsh plugin --profile web list
-```
-
-`npm run check` covers typechecking, Host/routes/security, delegation/trace correlation, turn concurrency, guarded draft dwell/auto-submit, floor timing, retry/tool invalidation, TTS sanitation, production build, and client-bundle purity.
-
-## Current risks
-
-- Desktop rc.5 denies renderer microphone permission, so the plugin opens the same loopback session in the default browser.
-- Provider latency, quota, model/voice availability, and ASR accuracy remain external dependencies.
-- Optional voiceprint verification adds one provider request per completed utterance, can add latency, and cannot resist replay, synthesis, or targeted impersonation.
-- The no-voiceprint auto-send opt-in is intended only for a trusted single-user acoustic environment; background speech can still become text, so sensitive commands remain manual and downstream tools must keep their own confirmation policies.
-- A tool preamble that becomes audible before its later tool-call event cannot be unheard; the output contract prevents such preambles and the trace gate cancels any remaining audio immediately.
-- First-paragraph TTS intentionally fails closed for machine-shaped Markdown/JSON/HTML output.
-- OpenAI and Qwen provider contracts can change; upgrades require trace and signaling regression tests.
+生成的 `lib/` 沿用上游仓库的提交方式；源文件修改后运行 `npm run check` 重建。开发启动脚本与真实服务自测仅属于源码 checkout，不随插件包发布。

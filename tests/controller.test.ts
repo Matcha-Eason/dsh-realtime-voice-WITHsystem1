@@ -1,631 +1,475 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
-import { VoiceController, type VoiceConnection, type VoiceConnectionFactory } from '../src/client/controller.ts'
-import type { HarnessBridge } from '../src/client/harness-delegate.ts'
+import test, { type TestContext } from 'node:test'
+import { VoiceController, type VoiceConnection, type VoiceDraftTarget, type DecideTurn } from '../src/client/controller.ts'
+import type { HarnessBridge, DelegateResult, SessionTurnCallbacks, VoiceContext } from '../src/client/harness-delegate.ts'
 import type { RealtimeCallbacks } from '../src/client/realtime.ts'
 import { updatePrefs } from '../src/client/prefs.ts'
+import type { TurnAction, TurnDecisionState } from '../src/turn-decision.ts'
 
-function installBrowserStubs(): void {
-  Object.defineProperty(globalThis, 'location', { configurable: true, value: { search: '', href: 'http://127.0.0.1/' } })
-  const values = new Map<string, string>()
-  Object.defineProperty(globalThis, 'localStorage', {
-    configurable: true,
-    value: {
-      getItem: (key: string) => values.get(key) ?? null,
-      setItem: (key: string, value: string) => values.set(key, value),
-    },
-  })
-}
-
-test('stop during connection prevents a late failure from replacing idle state', async () => {
-  installBrowserStubs()
-  let rejectConnect!: (error: Error) => void
-  let disconnects = 0
-  const connection: VoiceConnection = {
-    connect: async () => await new Promise<void>((_resolve, reject) => { rejectConnect = reject }),
-    disconnect: () => { disconnects++ },
-  }
-  const factory: VoiceConnectionFactory = () => connection
-  const bridge = {} as HarnessBridge
-  const controller = new VoiceController('s1', bridge, factory)
-  const connecting = controller.toggle()
-  controller.stop()
-  rejectConnect(new Error('late failure'))
-  await connecting
-  assert.equal(controller.getSnapshot().state, 'idle')
-  assert.equal(disconnects >= 1, true)
-})
-
-test('background transcript does not abort an active Harness turn', async () => {
-  installBrowserStubs()
-  updatePrefs({ qwenMergeMs: 100 })
-  let callbacks!: RealtimeCallbacks
-  let resolveDelegate!: (value: { ok: true; text: string }) => void
-  let delegated = 0
-  let activeSignal!: AbortSignal
-  let draft = ''
-  const connection: VoiceConnection = {
-    connect: async () => {},
-    disconnect: () => {},
-    speak: async () => {},
-  }
-  const factory: VoiceConnectionFactory = (_prefs, value) => { callbacks = value; return connection }
-  const bridge = {
-    delegate: async (_sessionId: string, _task: string, signal: AbortSignal) => {
-      delegated++
-      activeSignal = signal
-      return await new Promise<{ ok: true; text: string }>(resolve => { resolveDelegate = resolve })
-    },
-    cancel: async () => false,
-  } as unknown as HarnessBridge
-  const controller = new VoiceController('s1', bridge, factory)
-  controller.bindDraft({ getDraft: () => draft, setDraft: value => { draft = value } })
-  await controller.toggle()
-  await callbacks.onTranscript?.('查询上海天气')
-  await delay(130)
-  await callbacks.onTranscript?.('旁边的人在说话')
-  await delay(130)
-  assert.equal(delegated, 1)
-  assert.equal(activeSignal.aborted, false)
-  assert.equal(draft, '旁边的人在说话')
-  resolveDelegate({ ok: true, text: '天气晴朗' })
-  await delay(450)
-  assert.equal(controller.getSnapshot().state, 'listening')
-  await callbacks.onTranscript?.('今晚就这样吧')
-  await delay(130)
-  assert.equal(delegated, 1)
-  assert.equal(draft, '旁边的人在说话\n今晚就这样吧')
-})
-
-test('an existing native draft absorbs later listening transcripts until the user clears it', async () => {
-  installBrowserStubs()
-  updatePrefs({ qwenMergeMs: 100 })
-  let callbacks!: RealtimeCallbacks
-  let delegated = 0
-  let draft = '或者说明天能去哪里玩呢？'
-  const connection: VoiceConnection = { connect: async () => {}, disconnect: () => {}, speak: async () => {} }
-  const factory: VoiceConnectionFactory = (_prefs, value) => { callbacks = value; return connection }
-  const bridge = {
-    delegate: async () => {
-      delegated++
-      return { ok: true as const, text: '不应该执行' }
-    },
-  } as unknown as HarnessBridge
-  const controller = new VoiceController('s1', bridge, factory)
-  controller.bindDraft({ getDraft: () => draft, setDraft: value => { draft = value } })
-  await controller.toggle()
-  await callbacks.onTranscript?.('可以了，今晚就这样')
-  await delay(130)
-  assert.equal(delegated, 0)
-  assert.equal(draft, '或者说明天能去哪里玩呢？\n可以了，今晚就这样')
-  draft = ''
-  controller.bindDraft({ getDraft: () => draft, setDraft: value => { draft = value } })
-  await callbacks.onTranscript?.('这是清空后的新问题')
-  await delay(130)
-  assert.equal(delegated, 1)
-})
-
-test('Qwen composer mode auto-submits an idle utterance, stages busy speech, and speaks only the summary', async () => {
-  installBrowserStubs()
-  updatePrefs({ provider: 'qwen', qwenMergeMs: 100 })
-  let callbacks!: RealtimeCallbacks
-  let observer!: {
-    onTurnStart(turn: string): void
-    onTextDelta(turn: string, delta: string): void
-    onTurnEnd(turn: string, result: { ok: true; text: string }): void
-  }
-  let draft = ''
-  let submits = 0
-  const submitted: string[] = []
-  let delegates = 0
-  const spoken: string[] = []
-  const connection: VoiceConnection = {
-    connect: async () => {},
-    disconnect: () => {},
-    speak: async text => { spoken.push(text) },
-  }
-  const factory: VoiceConnectionFactory = (_prefs, value) => { callbacks = value; return connection }
-  const bridge = {
-    delegate: async () => { delegates++; return { ok: true as const, text: '不应执行' } },
-    setVoiceMode: async () => {},
-    observeSession: (_sessionId: string, value: typeof observer) => { observer = value; return () => {} },
-  } as unknown as HarnessBridge
-  const controller = new VoiceController('s1', bridge, factory)
-  controller.bindDraft({
-    getDraft: () => draft,
-    setDraft: value => { draft = value },
-    submit: () => {
-      submits++
-      submitted.push(draft)
-      draft = ''
-      observer.onTurnStart('native-turn')
-    },
-  })
-  await controller.toggle()
-  await callbacks.onTranscript?.('太好了。')
-  await delay(35)
-  await callbacks.onTranscript?.('已经调试成功了。')
-  await delay(130)
-  assert.equal(delegates, 0)
-  assert.equal(submits, 1)
-  assert.deepEqual(submitted, ['太好了。\n已经调试成功了。'])
-  assert.equal(draft, '')
-
-  await callbacks.onTranscript?.('推理期间说的下一轮内容。', { capturedWhileBusy: true })
-  await delay(130)
-  assert.equal(submits, 1)
-  assert.equal(draft, '推理期间说的下一轮内容。')
-
-  observer.onTextDelta('native-turn', '<!-- voice-summary -->已经成功了。<!--')
-  observer.onTextDelta('native-turn', ' /')
-  observer.onTextDelta('native-turn', 'voice')
-  observer.onTextDelta('native-turn', '-summary -->详细结果')
-  observer.onTurnEnd('native-turn', { ok: true, text: '<!-- voice-summary -->已经成功了。<!-- /voice-summary -->详细结果' })
-  await delay(450)
-  assert.deepEqual(spoken, ['已经成功了。'])
-  controller.stop()
-})
-
-test('native slow turn speaks one floor cue then the first answer paragraph', async () => {
-  installBrowserStubs()
-  updatePrefs({ provider: 'qwen', qwenMergeMs: 100, floorDelayMs: 400, floorComposerEnabled: false })
-  let callbacks!: RealtimeCallbacks
-  let observer!: {
-    onTurnStart(turn: string): void
-    onTextDelta(turn: string, delta: string): void
-    onTurnEnd(turn: string, result: { ok: true; text: string }): void
-  }
-  let draft = ''
-  const spoken: string[] = []
-  const connection: VoiceConnection = {
-    connect: async () => {},
-    disconnect: () => {},
-    speak: async text => { spoken.push(text) },
-  }
-  const bridge = {
-    delegate: async () => ({ ok: true as const, text: 'unused' }),
-    setVoiceMode: async () => {},
-    observeSession: (_sessionId: string, value: typeof observer) => { observer = value; return () => {} },
-  } as unknown as HarnessBridge
-  const controller = new VoiceController('s1', bridge, (_prefs, value) => { callbacks = value; return connection })
-  controller.bindDraft({
-    getDraft: () => draft,
-    setDraft: value => { draft = value },
-    submit: () => { draft = ''; observer.onTurnStart('slow-turn') },
-  })
-  await controller.toggle()
-  await callbacks.onTranscript?.('分析一下这个训练计划')
-  await delay(130)
-  await delay(430)
-  observer.onTextDelta('slow-turn', '这个计划可以继续，但要调整动作顺序。\n\n以下是详细安排。')
-  observer.onTurnEnd('slow-turn', { ok: true, text: '这个计划可以继续，但要调整动作顺序。\n\n以下是详细安排。' })
-  await delay(450)
-  assert.equal(spoken.length, 2)
-  assert.match(spoken[0] ?? '', /训练计划|重点|理一理/)
-  assert.equal(spoken[1], '这个计划可以继续，但要调整动作顺序。')
-  controller.stop()
-})
-
-test('native fast turn cancels the floor cue', async () => {
-  installBrowserStubs()
-  updatePrefs({ provider: 'qwen', qwenMergeMs: 100, floorDelayMs: 400 })
-  let callbacks!: RealtimeCallbacks
-  let observer!: {
-    onTurnStart(turn: string): void
-    onTextDelta(turn: string, delta: string): void
-    onTurnEnd(turn: string, result: { ok: true; text: string }): void
-  }
-  let draft = ''
-  const spoken: string[] = []
-  const connection: VoiceConnection = { connect: async () => {}, disconnect: () => {}, speak: async text => { spoken.push(text) } }
-  const bridge = {
-    delegate: async () => ({ ok: true as const, text: 'unused' }),
-    setVoiceMode: async () => {},
-    observeSession: (_sessionId: string, value: typeof observer) => { observer = value; return () => {} },
-  } as unknown as HarnessBridge
-  const controller = new VoiceController('s1', bridge, (_prefs, value) => { callbacks = value; return connection })
-  controller.bindDraft({
-    getDraft: () => draft,
-    setDraft: value => { draft = value },
-    submit: () => { draft = ''; observer.onTurnStart('fast-turn') },
-  })
-  await controller.toggle()
-  await callbacks.onTranscript?.('你好')
-  await delay(130)
-  observer.onTextDelta('fast-turn', '你好，很高兴见到你。')
-  observer.onTurnEnd('fast-turn', { ok: true, text: '你好，很高兴见到你。' })
-  await delay(450)
-  assert.deepEqual(spoken, ['你好，很高兴见到你。'])
-  controller.stop()
-})
-
-test('a busy transcript stays in the draft even when Harness completes before endpoint grace', async () => {
-  installBrowserStubs()
-  updatePrefs({ qwenMergeMs: 100 })
-  let callbacks!: RealtimeCallbacks
-  let resolveDelegate!: (value: { ok: true; text: string }) => void
-  let delegates = 0
-  let draft = ''
-  const connection: VoiceConnection = { connect: async () => {}, disconnect: () => {}, speak: async () => {} }
-  const factory: VoiceConnectionFactory = (_prefs, value) => { callbacks = value; return connection }
-  const bridge = {
-    delegate: async () => {
-      delegates++
-      return await new Promise<{ ok: true; text: string }>(resolve => { resolveDelegate = resolve })
-    },
-  } as unknown as HarnessBridge
-  const controller = new VoiceController('s1', bridge, factory)
-  controller.bindDraft({ getDraft: () => draft, setDraft: value => { draft = value } })
-  await controller.toggle()
-  await callbacks.onTranscript?.('第一轮')
-  await delay(130)
-  await callbacks.onTranscript?.('完成后继续检查测试')
-  resolveDelegate({ ok: true, text: '完成' })
-  await delay(550)
-  assert.equal(delegates, 1)
-  assert.equal(draft, '完成后继续检查测试')
-})
-
-test('a late ASR final keeps the busy provenance from its speech-start event', async () => {
-  installBrowserStubs()
-  updatePrefs({ qwenMergeMs: 100 })
-  let callbacks!: RealtimeCallbacks
-  let delegates = 0
-  let draft = ''
-  const connection: VoiceConnection = { connect: async () => {}, disconnect: () => {}, speak: async () => {} }
-  const factory: VoiceConnectionFactory = (_prefs, value) => { callbacks = value; return connection }
-  const bridge = {
-    delegate: async () => {
-      delegates++
-      return { ok: true as const, text: '已完成' }
-    },
-  } as unknown as HarnessBridge
-  const controller = new VoiceController('s1', bridge, factory)
-  controller.bindDraft({ getDraft: () => draft, setDraft: value => { draft = value } })
-  await controller.toggle()
-  await callbacks.onTranscript?.('第一轮')
-  await delay(550)
-  assert.equal(controller.getSnapshot().state, 'listening')
-  await callbacks.onTranscript?.('语音开始时其实仍在忙', { capturedWhileBusy: true })
-  await delay(130)
-  assert.equal(delegates, 1)
-  assert.equal(draft, '语音开始时其实仍在忙')
-})
-
-test('speech captured during TTS is staged and never starts a second Harness turn', async () => {
-  installBrowserStubs()
-  updatePrefs({ qwenMergeMs: 100 })
-  let callbacks!: RealtimeCallbacks
-  let rejectSpeech!: (error: Error) => void
-  let delegates = 0
-  let draft = ''
-  const connection: VoiceConnection = {
-    connect: async () => {},
-    disconnect: () => {},
-    speak: async () => await new Promise<void>((_resolve, reject) => { rejectSpeech = reject }),
-  }
-  const factory: VoiceConnectionFactory = (_prefs, value) => { callbacks = value; return connection }
-  const bridge = {
-    delegate: async () => {
-      delegates++
-      return { ok: true as const, text: '<!--voice-summary-->第一轮回答。<!--/voice-summary-->详细内容' }
-    },
-  } as unknown as HarnessBridge
-  const controller = new VoiceController('s1', bridge, factory)
-  controller.bindDraft({ getDraft: () => draft, setDraft: value => { draft = value } })
-  await controller.toggle()
-  await callbacks.onTranscript?.('第一轮问题')
-  await delay(130)
-  callbacks.onState('speaking')
-  await callbacks.onTranscript?.('这是打断后准备发送的话')
-  rejectSpeech(new Error('语音播放已被用户打断'))
-  await delay(550)
-  assert.equal(delegates, 1)
-  assert.equal(draft, '这是打断后准备发送的话')
-  assert.equal(controller.getSnapshot().state, 'listening')
-})
-
-test('short ASR finals merge into one Harness paragraph', async () => {
-  installBrowserStubs()
-  updatePrefs({ qwenMergeMs: 100 })
-  let callbacks!: RealtimeCallbacks
-  const tasks: string[] = []
-  const voiceContextFlags: boolean[] = []
-  const connection: VoiceConnection = { connect: async () => {}, disconnect: () => {}, speak: async () => {} }
-  const factory: VoiceConnectionFactory = (_prefs, value) => { callbacks = value; return connection }
-  const bridge = {
-    delegate: async (_sessionId: string, task: string, _signal: AbortSignal, options: { voiceOutputContract?: boolean }) => {
-      tasks.push(task)
-      voiceContextFlags.push(options.voiceOutputContract === true)
-      return { ok: true as const, text: '收到' }
-    },
-  } as unknown as HarnessBridge
-  const controller = new VoiceController('s1', bridge, factory)
-  await controller.toggle()
-  await callbacks.onTranscript?.('这是第一小句')
-  await delay(35)
-  await callbacks.onTranscript?.('这是接着说的第二小句')
-  await delay(130)
-  assert.equal(tasks.length, 1)
-  assert.equal(tasks[0], '这是第一小句\n这是接着说的第二小句')
-  assert.doesNotMatch(tasks[0] ?? '', /voice-summary|dsh-realtime-voice/)
-  assert.deepEqual(voiceContextFlags, [true])
-})
-
-test('a transcript arriving before TTS starts cannot preempt the pending reply', async () => {
-  installBrowserStubs()
-  updatePrefs({ qwenMergeMs: 100 })
-  let callbacks!: RealtimeCallbacks
-  let resolveSpeech!: () => void
-  let delegates = 0
-  let draft = ''
-  const connection: VoiceConnection = {
-    connect: async () => {},
-    disconnect: () => {},
-    speak: async () => await new Promise<void>(resolve => { resolveSpeech = resolve }),
-  }
-  const factory: VoiceConnectionFactory = (_prefs, value) => { callbacks = value; return connection }
-  const bridge = {
-    delegate: async () => {
-      delegates++
-      return { ok: true as const, text: '<!--voice-summary-->第一轮结果。<!--/voice-summary-->详细结果' }
-    },
-  } as unknown as HarnessBridge
-  const controller = new VoiceController('s1', bridge, factory)
-  controller.bindDraft({ getDraft: () => draft, setDraft: value => { draft = value } })
-  await controller.toggle()
-  await callbacks.onTranscript?.('第一轮')
-  await delay(130)
-  await callbacks.onTranscript?.('播放前的背景短句')
-  await delay(130)
-  assert.equal(delegates, 1)
-  assert.equal(draft, '播放前的背景短句')
-  resolveSpeech()
-  await delay(0)
-})
-
-test('busy ASR draft auto-submits once only after playback and dwell', async () => {
-  installBrowserStubs()
+function setup(t: TestContext, options: {
+  decide?: DecideTurn
+  action?: TurnAction
+  connect?: () => Promise<void>
+  autoAudio?: boolean
+  speak?: (text: string) => Promise<void>
+  cancelSpeech?: () => void
+  delegate?: (text: string, signal: AbortSignal) => Promise<DelegateResult>
+} = {}) {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] })
+  const storage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: { getItem: () => null, setItem() {} } })
+  t.mock.method(globalThis, 'fetch', async () => new Response('{}', { status: 200 }))
   updatePrefs({
-    provider: 'qwen',
-    qwenMergeMs: 100,
-    voiceDraftAutoSend: true,
-    voiceDraftDwellMs: 500,
-    voiceDraftAllowWithoutVoiceprint: true,
-    voiceDraftSensitiveDeny: true,
+    decisionEnabled: true, proactiveEnabled: true, decisionTimeoutMs: 2000, qwenMergeMs: 100,
+    voiceDraftDwellMs: 500, voiceDraftAutoSend: true, voiceDraftAllowWithoutVoiceprint: true,
+    voiceDraftSensitiveDeny: true, voiceprintEnabled: false,
   })
   let callbacks!: RealtimeCallbacks
-  let observer!: {
-    onTurnStart(turn: string): void
-    onTextDelta(turn: string, delta: string): void
-    onTurnEnd(turn: string, result: { ok: true; text: string }): void
-  }
-  let draft = ''
+  const observers: SessionTurnCallbacks[] = []
+  const contexts: Array<{ active: boolean; context?: VoiceContext }> = []
+  const decisions: TurnDecisionState[] = []
   const submitted: string[] = []
-  const connection: VoiceConnection = {
-    connect: async () => {},
-    disconnect: () => {},
-    speak: async () => {},
-    waitForSpeechIdle: async () => {},
-  }
-  const bridge = {
-    setVoiceMode: async () => {},
-    observeSession: (_sessionId: string, value: typeof observer) => { observer = value; return () => {} },
-  } as unknown as HarnessBridge
-  const controller = new VoiceController('s1', bridge, (_prefs, value) => { callbacks = value; return connection })
-  controller.bindDraft({
-    getDraft: () => draft,
-    setDraft: value => { draft = value },
-    submit: () => { submitted.push(draft); draft = '' },
-  })
-  await controller.toggle()
-  observer.onTurnStart('busy-turn')
-  await callbacks.onTranscript?.('明天能去哪里玩？', { capturedWhileBusy: true })
-  await delay(130)
-  assert.equal(draft, '明天能去哪里玩？')
-  observer.onTextDelta('busy-turn', '夜宵推荐已经整理好了。')
-  observer.onTurnEnd('busy-turn', { ok: true, text: '夜宵推荐已经整理好了。' })
-  await delay(900)
-  assert.deepEqual(submitted, [])
-  await delay(500)
-  assert.deepEqual(submitted, ['明天能去哪里玩？'])
-  controller.stop()
-})
-
-test('new speech during draft dwell merges the whole utterance and restarts the timer', async () => {
-  installBrowserStubs()
-  updatePrefs({ qwenMergeMs: 100, voiceDraftAutoSend: true, voiceDraftDwellMs: 500, voiceDraftAllowWithoutVoiceprint: true })
-  let callbacks!: RealtimeCallbacks
-  let observer!: {
-    onTurnStart(turn: string): void
-    onTextDelta(turn: string, delta: string): void
-    onTurnEnd(turn: string, result: { ok: true; text: string }): void
-  }
-  let draft = ''
-  const submitted: string[] = []
-  const connection: VoiceConnection = { connect: async () => {}, disconnect: () => {}, speak: async () => {}, waitForSpeechIdle: async () => {} }
-  const bridge = {
-    setVoiceMode: async () => {},
-    observeSession: (_sessionId: string, value: typeof observer) => { observer = value; return () => {} },
-  } as unknown as HarnessBridge
-  const controller = new VoiceController('s1', bridge, (_prefs, value) => { callbacks = value; return connection })
-  controller.bindDraft({ getDraft: () => draft, setDraft: value => { draft = value }, submit: () => { submitted.push(draft); draft = '' } })
-  await controller.toggle()
-  observer.onTurnStart('busy-turn')
-  await callbacks.onTranscript?.('明天能去哪里玩？', { capturedWhileBusy: true })
-  await delay(130)
-  observer.onTextDelta('busy-turn', '第一轮完成。')
-  observer.onTurnEnd('busy-turn', { ok: true, text: '第一轮完成。' })
-  await delay(650)
-  callbacks.onSpeechStart?.()
-  await delay(250)
-  assert.deepEqual(submitted, [])
-  callbacks.onSpeechEnd?.()
-  await callbacks.onTranscript?.('可以了，今晚就这样。')
-  await delay(130)
-  assert.equal(draft, '明天能去哪里玩？\n可以了，今晚就这样。')
-  await delay(700)
-  assert.deepEqual(submitted, [])
-  await delay(300)
-  assert.deepEqual(submitted, ['明天能去哪里玩？\n可以了，今晚就这样。'])
-  controller.stop()
-})
-
-test('a user draft revision revokes the ASR lease even when text ends unchanged', async () => {
-  installBrowserStubs()
-  updatePrefs({ qwenMergeMs: 100, voiceDraftAutoSend: true, voiceDraftDwellMs: 500, voiceDraftAllowWithoutVoiceprint: true })
-  let callbacks!: RealtimeCallbacks
-  let observer!: {
-    onTurnStart(turn: string): void
-    onTextDelta(turn: string, delta: string): void
-    onTurnEnd(turn: string, result: { ok: true; text: string }): void
-  }
+  const spoken: string[] = []
+  const delegated: Array<{ text: string; signal: AbortSignal }> = []
   let draft = ''
   let draftRev = 0
-  let submits = 0
-  const connection: VoiceConnection = { connect: async () => {}, disconnect: () => {}, speak: async () => {}, waitForSpeechIdle: async () => {} }
+  let busy = false
+  let pauses = 0
+  let resumes = 0
+  let audioCancels = 0
+  let taskCancels = 0
+  let disconnects = 0
+  let queued: string[] = []
+  const idle: Array<() => void> = []
+  const source: VoiceConnection = {
+    connect: options.connect ?? (async () => {}),
+    disconnect: () => { disconnects++; queued = []; idle.splice(0).forEach(resolve => resolve()) },
+    speak: async text => {
+      spoken.push(text)
+      queued.push(text)
+      if (options.autoAudio !== false) callbacks.onState('speaking')
+      await options.speak?.(text)
+    },
+    waitForSpeechIdle: async () => { if (queued.length) await new Promise<void>(resolve => idle.push(resolve)) },
+    pauseSpeech: () => { pauses++ },
+    resumeSpeech: () => { resumes++ },
+    cancelSpeech: () => { audioCancels++; queued = []; idle.splice(0).forEach(resolve => resolve()); options.cancelSpeech?.() },
+  }
   const bridge = {
-    setVoiceMode: async () => {},
-    observeSession: (_sessionId: string, value: typeof observer) => { observer = value; return () => {} },
+    observeSession: (_id: string, observer: SessionTurnCallbacks) => { observers.push(observer); return () => {} },
+    setVoiceMode: async (_id: string, active: boolean, _signal?: AbortSignal, context?: VoiceContext) => { contexts.push({ active, context }) },
+    isBusy: () => busy,
+    cancel: async () => { taskCancels++; return true },
+    delegate: async (_id: string, text: string, signal: AbortSignal) => {
+      delegated.push({ text, signal })
+      if (options.delegate) return await options.delegate(text, signal)
+      return await new Promise<DelegateResult>(resolve => signal.addEventListener('abort', () => resolve({ ok: false, cancelled: true, error: 'cancelled' }), { once: true }))
+    },
   } as unknown as HarnessBridge
-  const controller = new VoiceController('s1', bridge, (_prefs, value) => { callbacks = value; return connection })
-  const bind = () => controller.bindDraft({
-    getDraft: () => draft,
-    getDraftRev: () => draftRev,
-    getPhase: () => 'plain',
-    setDraft: value => { draft = value; draftRev++ },
-    submit: () => { submits++; draft = ''; draftRev++ },
+  const controller = new VoiceController('session', bridge, (_prefs, value) => { callbacks = value; return source }, async (state, signal) => {
+    decisions.push({ ...state })
+    return options.decide ? await options.decide(state, signal) : { action: options.action ?? 'submit', revision: state.revision }
   })
-  bind()
-  await controller.toggle()
-  observer.onTurnStart('busy-turn')
-  await callbacks.onTranscript?.('原始语音', { capturedWhileBusy: true })
-  await delay(130)
-  bind()
-  observer.onTextDelta('busy-turn', '完成。')
-  observer.onTurnEnd('busy-turn', { ok: true, text: '完成。' })
-  await delay(500)
-  // Simulate typing and undoing back to byte-identical text. draftRev still
-  // proves that the user touched the composer, so auto-send must be revoked.
-  draftRev++
-  bind()
-  await delay(650)
-  assert.equal(submits, 0)
-  assert.equal(draft, '原始语音')
-  controller.stop()
-})
-
-test('voiceprint failures and sensitive drafts stay manual', async () => {
-  installBrowserStubs()
-  updatePrefs({
-    qwenMergeMs: 100,
-    voiceDraftAutoSend: true,
-    voiceDraftDwellMs: 500,
-    voiceDraftAllowWithoutVoiceprint: true,
-    voiceDraftSensitiveDeny: true,
+  const start = (turn: string) => { busy = true; observers.at(-1)!.onTurnStart(turn) }
+  const target: VoiceDraftTarget = {
+    getDraft: () => draft, getDraftRev: () => draftRev, getPhase: () => 'plain',
+    setDraft: text => { draft = text; draftRev++; controller.bindDraft(target) },
+    submit: () => { submitted.push(draft); draft = ''; draftRev++; controller.bindDraft(target); start(`native-${submitted.length}`) },
+  }
+  controller.bindDraft(target)
+  t.after(() => {
+    controller.dispose()
+    if (storage) Object.defineProperty(globalThis, 'localStorage', storage)
+    else Reflect.deleteProperty(globalThis, 'localStorage')
   })
-  let callbacks!: RealtimeCallbacks
-  let observer!: {
-    onTurnStart(turn: string): void
-    onTextDelta(turn: string, delta: string): void
-    onTurnEnd(turn: string, result: { ok: true; text: string }): void
+  return {
+    controller, contexts, decisions, submitted, spoken, delegated, observers, source,
+    get callbacks() { return callbacks },
+    draft: () => draft,
+    edit(text: string) { draft = text; draftRev++; controller.bindDraft(target) },
+    sameTextEdit() { draftRev++; controller.bindDraft(target) },
+    counts: () => ({ pauses, resumes, audioCancels, taskCancels, disconnects }),
+    start,
+    text(turn: string, text: string) { observers.at(-1)!.onTextDelta(turn, text) },
+    end(turn: string, text: string) { busy = false; observers.at(-1)!.onTurnEnd(turn, { ok: true, text }) },
+    finishAudio() { const completed = queued; queued = []; completed.forEach(text => callbacks.onPlaybackProgress?.(text)); idle.splice(0).forEach(resolve => resolve()) },
   }
-  let draft = ''
-  let submits = 0
-  const connection: VoiceConnection = { connect: async () => {}, disconnect: () => {}, speak: async () => {}, waitForSpeechIdle: async () => {} }
-  const bridge = {
-    setVoiceMode: async () => {},
-    observeSession: (_sessionId: string, value: typeof observer) => { observer = value; return () => {} },
-  } as unknown as HarnessBridge
-  const controller = new VoiceController('s1', bridge, (_prefs, value) => { callbacks = value; return connection })
-  controller.bindDraft({ getDraft: () => draft, setDraft: value => { draft = value }, submit: () => { submits++; draft = '' } })
-  await controller.toggle()
-  observer.onTurnStart('busy-turn')
-  await callbacks.onTranscript?.('旁边的人说的内容', { capturedWhileBusy: true, voiceprint: 'rejected' })
-  await delay(130)
-  observer.onTextDelta('busy-turn', '完成。')
-  observer.onTurnEnd('busy-turn', { ok: true, text: '完成。' })
-  await delay(1100)
-  assert.equal(submits, 0)
-  draft = ''
-  controller.bindDraft({ getDraft: () => draft, setDraft: value => { draft = value }, submit: () => { submits++; draft = '' } })
-  observer.onTurnStart('busy-turn-2')
-  await callbacks.onTranscript?.('帮我付款一百元', { capturedWhileBusy: true })
-  await delay(130)
-  observer.onTextDelta('busy-turn-2', '完成。')
-  observer.onTurnEnd('busy-turn-2', { ok: true, text: '完成。' })
-  await delay(1100)
-  assert.equal(submits, 0)
-  assert.equal(draft, '帮我付款一百元')
-  controller.stop()
+}
+
+async function advance(t: TestContext, ms = 0): Promise<void> {
+  t.mock.timers.tick(ms)
+  for (let step = 0; step < 12; step++) await Promise.resolve()
+}
+
+async function final(fx: ReturnType<typeof setup>, text: string, utteranceId: string): Promise<void> {
+  fx.callbacks.onSpeechStart?.({ utteranceId })
+  fx.callbacks.onSpeechEnd?.({ utteranceId })
+  await fx.callbacks.onTranscript?.(text, { utteranceId })
+}
+
+test('incomplete final waits and later complete speech combines into exactly one native submission', async t => {
+  const fx = setup(t, { decide: async state => ({ action: state.transcript.includes('上海') ? 'submit' : 'wait', revision: state.revision }) })
+  await fx.controller.toggle()
+  await final(fx, '我想问一下', 'one')
+  await advance(t, 100)
+  assert.deepEqual(fx.submitted, [])
+  await final(fx, '明天上海会下雨吗？', 'two')
+  await advance(t, 100)
+  assert.deepEqual(fx.submitted, ['我想问一下\n明天上海会下雨吗？'])
+  await advance(t, 1000)
+  assert.equal(fx.submitted.length, 1)
+  assert.equal(fx.delegated.length, 0)
 })
 
-test('speech activity cancels commit, never cuts a long phrase, and filler safely resumes after speech end', async () => {
-  installBrowserStubs()
-  updatePrefs({ qwenMergeMs: 100, voiceDraftAutoSend: true, voiceDraftDwellMs: 500, voiceDraftAllowWithoutVoiceprint: true })
-  let callbacks!: RealtimeCallbacks
-  let observer!: {
-    onTurnStart(turn: string): void
-    onTextDelta(turn: string, delta: string): void
-    onTurnEnd(turn: string, result: { ok: true; text: string }): void
-  }
-  let draft = ''
-  let submits = 0
-  const connection: VoiceConnection = { connect: async () => {}, disconnect: () => {}, speak: async () => {}, waitForSpeechIdle: async () => {} }
-  const bridge = {
-    setVoiceMode: async () => {},
-    observeSession: (_sessionId: string, value: typeof observer) => { observer = value; return () => {} },
-  } as unknown as HarnessBridge
-  const controller = new VoiceController('s1', bridge, (_prefs, value) => { callbacks = value; return connection })
-  controller.bindDraft({ getDraft: () => draft, setDraft: value => { draft = value }, submit: () => { submits++; draft = '' } })
-  await controller.toggle()
-  observer.onTurnStart('busy-turn')
-  await callbacks.onTranscript?.('保留这一句', { capturedWhileBusy: true })
-  await delay(130)
-  observer.onTextDelta('busy-turn', '完成。')
-  observer.onTurnEnd('busy-turn', { ok: true, text: '完成。' })
-  await delay(950)
-  assert.match(controller.getSnapshot().detail, /即将发送/)
-  callbacks.onSpeechStart?.()
-  assert.match(controller.getSnapshot().detail, /等待本句识别/)
-  await delay(2000)
-  assert.equal(submits, 0)
-  // Only speech_stopped may resume. No actionable final follows (for example
-  // a cough), so the old lease resumes without cutting a long phrase.
-  callbacks.onSpeechEnd?.()
-  await delay(1600)
-  assert.equal(submits, 1)
-  controller.stop()
+test('an active speaker blocks submission even when ASR marks a fragment final', async t => {
+  const fx = setup(t)
+  await fx.controller.toggle()
+  fx.callbacks.onSpeechStart?.({ utteranceId: 'one' })
+  await fx.callbacks.onTranscript?.('我已经说完这部分', { utteranceId: 'one' })
+  await advance(t, 100)
+  assert.equal(fx.submitted.length, 0)
+  fx.callbacks.onSpeechEnd?.({ utteranceId: 'one' })
+  await advance(t, 100)
+  assert.equal(fx.submitted.length, 1)
 })
 
-test('draft auto-send defaults fail closed without voiceprint opt-in', async () => {
-  installBrowserStubs()
-  updatePrefs({ qwenMergeMs: 100, voiceDraftAutoSend: true, voiceDraftDwellMs: 500, voiceDraftAllowWithoutVoiceprint: false, voiceprintEnabled: false })
-  let callbacks!: RealtimeCallbacks
-  let observer!: {
-    onTurnStart(turn: string): void
-    onTextDelta(turn: string, delta: string): void
-    onTurnEnd(turn: string, result: { ok: true; text: string }): void
-  }
-  let draft = ''
-  let submits = 0
-  const connection: VoiceConnection = { connect: async () => {}, disconnect: () => {}, speak: async () => {}, waitForSpeechIdle: async () => {} }
-  const bridge = {
-    setVoiceMode: async () => {},
-    observeSession: (_sessionId: string, value: typeof observer) => { observer = value; return () => {} },
-  } as unknown as HarnessBridge
-  const controller = new VoiceController('s1', bridge, (_prefs, value) => { callbacks = value; return connection })
-  controller.bindDraft({ getDraft: () => draft, setDraft: value => { draft = value }, submit: () => { submits++; draft = '' } })
-  await controller.toggle()
-  observer.onTurnStart('busy-turn')
-  await callbacks.onTranscript?.('无声纹的后续语音', { capturedWhileBusy: true })
-  await delay(130)
-  observer.onTextDelta('busy-turn', '完成。')
-  observer.onTurnEnd('busy-turn', { ok: true, text: '完成。' })
-  await delay(1500)
-  assert.equal(submits, 0)
-  assert.equal(draft, '无声纹的后续语音')
-  controller.stop()
+test('keyboard text or draft revision changes revoke automatic submission', async t => {
+  const fx = setup(t)
+  await fx.controller.toggle()
+  await final(fx, '查询天气', 'one')
+  fx.sameTextEdit()
+  await advance(t, 100)
+  assert.equal(fx.submitted.length, 0)
+  await final(fx, '补充上海', 'two')
+  fx.edit('我用键盘改成北京')
+  await advance(t, 100)
+  assert.deepEqual(fx.submitted, [])
+  assert.equal(fx.draft(), '我用键盘改成北京')
 })
 
-function delay(ms: number): Promise<void> { return new Promise(resolve => setTimeout(resolve, ms)) }
+test('duplicate finals and late partials cannot duplicate a submitted utterance', async t => {
+  const fx = setup(t)
+  await fx.controller.toggle()
+  await final(fx, '查询天气', 'same')
+  await fx.callbacks.onTranscript?.('查询天气', { utteranceId: 'same' })
+  fx.callbacks.onPartialTranscript?.('过时的内容', { utteranceId: 'same' })
+  await advance(t, 100)
+  assert.deepEqual(fx.submitted, ['查询天气'])
+  await fx.callbacks.onTranscript?.('查询天气', { utteranceId: 'same' })
+  await advance(t, 1000)
+  assert.equal(fx.submitted.length, 1)
+})
+
+test('acknowledgement soft pause resumes the same audio without replay or task cancellation', async t => {
+  const fx = setup(t, { action: 'backchannel' })
+  await fx.controller.toggle()
+  fx.start('manual')
+  fx.text('manual', '这是当前主模型的第一句话。')
+  await advance(t)
+  await final(fx, '嗯，对', 'ack')
+  await advance(t, 100)
+  assert.equal(fx.counts().pauses, 1)
+  assert.equal(fx.counts().resumes, 1)
+  assert.equal(fx.counts().audioCancels, 0)
+  assert.equal(fx.counts().taskCancels, 0)
+  assert.deepEqual(fx.spoken, ['这是当前主模型的第一句话。'])
+  assert.equal(fx.draft(), '')
+  fx.end('manual', '这是当前主模型的第一句话。')
+  fx.finishAudio()
+  await advance(t)
+  assert.equal(fx.controller.getSnapshot().playback, 'idle')
+  assert.deepEqual(fx.spoken, ['这是当前主模型的第一句话。'])
+})
+
+test('true barge-in cancels speech only, keeps the task running, and submits after its end', async t => {
+  const fx = setup(t, { decide: async state => ({ action: state.mainBusy || state.assistantSpeaking ? 'interrupt' : 'submit', revision: state.revision }) })
+  await fx.controller.toggle()
+  fx.start('manual')
+  fx.text('manual', '这是将被打断的回答。')
+  await advance(t)
+  await final(fx, '换成查询北京天气', 'new-question')
+  await advance(t, 100)
+  assert.equal(fx.counts().audioCancels, 1)
+  assert.equal(fx.counts().taskCancels, 0)
+  assert.equal(fx.submitted.length, 0)
+  fx.text('manual', '不应再次播出的后续。')
+  fx.end('manual', '这是将被打断的回答。不应再次播出的后续。')
+  await advance(t, 500)
+  assert.deepEqual(fx.submitted, ['换成查询北京天气'])
+  assert.deepEqual(fx.spoken, ['这是将被打断的回答。'])
+})
+
+test('explicit task cancellation stops audio and asks Harness to cancel', async t => {
+  const fx = setup(t)
+  await fx.controller.toggle()
+  fx.start('manual')
+  fx.text('manual', '原有回答。')
+  await advance(t)
+  await final(fx, '取消这次任务', 'cancel')
+  await advance(t)
+  assert.equal(fx.counts().audioCancels, 1)
+  assert.equal(fx.counts().taskCancels, 1)
+  assert.equal(fx.draft(), '')
+  assert.deepEqual(fx.submitted, [])
+})
+
+test('stale decisions are discarded and only the latest pending snapshot is evaluated', async t => {
+  const resolvers: Array<(action: TurnAction) => void> = []
+  const fx = setup(t, { decide: (state, _signal) => new Promise(resolve => resolvers.push(action => resolve({ action, revision: state.revision }))) })
+  await fx.controller.toggle()
+  await final(fx, '第一段', 'one')
+  await advance(t, 100)
+  await final(fx, '第二段', 'two')
+  await final(fx, '第三段', 'three')
+  await advance(t, 100)
+  assert.equal(fx.decisions.length, 1)
+  resolvers[0]!('submit')
+  await advance(t)
+  assert.deepEqual(fx.submitted, [])
+  await advance(t)
+  assert.equal(fx.decisions.length, 2)
+  assert.equal(fx.decisions[1]?.transcript, '第一段\n第二段\n第三段')
+  resolvers[1]!('submit')
+  await advance(t)
+  assert.deepEqual(fx.submitted, ['第一段\n第二段\n第三段'])
+})
+
+test('approved proactive interjection uses only the main model and can start during ongoing speech', async t => {
+  const fx = setup(t, { action: 'interject' })
+  await fx.controller.toggle()
+  fx.callbacks.onSpeechStart?.({ utteranceId: 'speaking' })
+  fx.callbacks.onPartialTranscript?.('那个服务', { utteranceId: 'speaking' })
+  fx.callbacks.onPartialTranscript?.('那个服务部署时', { utteranceId: 'speaking' })
+  await advance(t, 200)
+  assert.equal(fx.delegated.length, 1)
+  assert.equal(fx.delegated[0]?.text, '那个服务部署时')
+  assert.equal(fx.contexts.at(-1)?.context?.interject, true)
+  fx.start('clarification')
+  fx.text('clarification', '你指的是哪个服务？')
+  await advance(t)
+  assert.deepEqual(fx.spoken, ['你指的是哪个服务？'])
+  assert.equal(fx.controller.getSnapshot().userSpeaking, true)
+  assert.equal(fx.controller.getSnapshot().playback, 'playing')
+})
+
+test('changing speech during main-model preparation cancels the unheard interjection', async t => {
+  const fx = setup(t, { action: 'interject' })
+  await fx.controller.toggle()
+  fx.callbacks.onSpeechStart?.({ utteranceId: 'speaking' })
+  fx.callbacks.onPartialTranscript?.('那个服务', { utteranceId: 'speaking' })
+  fx.callbacks.onPartialTranscript?.('那个服务部署时', { utteranceId: 'speaking' })
+  await advance(t, 200)
+  fx.start('clarification')
+  fx.callbacks.onPartialTranscript?.('那个服务部署时，就是订单服务', { utteranceId: 'speaking' })
+  fx.text('clarification', '你指的是哪个服务？')
+  await advance(t)
+  assert.equal(fx.delegated[0]?.signal.aborted, true)
+  assert.deepEqual(fx.spoken, [])
+  assert.equal(fx.contexts.at(-1)?.context?.interject, undefined)
+})
+
+test('a prepared TTS chunk is still cancellable until the first audible audio arrives', async t => {
+  const fx = setup(t, { action: 'interject', autoAudio: false })
+  await fx.controller.toggle()
+  fx.callbacks.onSpeechStart?.({ utteranceId: 'speaking' })
+  fx.callbacks.onPartialTranscript?.('那个服务', { utteranceId: 'speaking' })
+  fx.callbacks.onPartialTranscript?.('那个服务部署时', { utteranceId: 'speaking' })
+  await advance(t, 200)
+  fx.start('clarification')
+  fx.text('clarification', '你指的是哪个服务？')
+  await advance(t)
+  assert.deepEqual(fx.spoken, ['你指的是哪个服务？'])
+  fx.callbacks.onPartialTranscript?.('那个服务部署时，就是订单服务', { utteranceId: 'speaking' })
+  await advance(t)
+  assert.equal(fx.delegated[0]?.signal.aborted, true)
+  assert.equal(fx.counts().audioCancels, 1)
+  fx.callbacks.onState('speaking') // stale transport notification must not resurrect a muted output
+  assert.equal(fx.controller.getSnapshot().playback, 'idle')
+})
+
+test('keyboard submitted main-model output is spoken once, including sentences after tools', async t => {
+  const fx = setup(t)
+  await fx.controller.toggle()
+  fx.start('keyboard')
+  fx.text('keyboard', '正在查找。')
+  await advance(t)
+  fx.observers.at(-1)!.onTextReset?.('keyboard', 'tool')
+  fx.text('keyboard', '查到了，这是结果。')
+  fx.end('keyboard', '查到了，这是结果。')
+  fx.finishAudio()
+  await advance(t)
+  fx.finishAudio()
+  await advance(t)
+  assert.deepEqual(fx.spoken, ['正在查找。', '查到了，这是结果。'])
+  assert.deepEqual(fx.delegated, [])
+  assert.deepEqual(fx.submitted, [])
+})
+
+test('stop during connect and late transport callbacks cannot replace idle state', async t => {
+  let rejectConnect!: (reason: Error) => void
+  const fx = setup(t, { connect: () => new Promise((_resolve, reject) => { rejectConnect = reject }) })
+  const pending = fx.controller.toggle()
+  await advance(t)
+  fx.controller.stop()
+  rejectConnect(new Error('late connection failure'))
+  await pending
+  fx.callbacks.onState('error', 'late error')
+  await fx.callbacks.onTranscript?.('不应发送', { utteranceId: 'late' })
+  await advance(t, 1000)
+  assert.equal(fx.controller.getSnapshot().state, 'idle')
+  assert.deepEqual(fx.submitted, [])
+  assert.equal(fx.counts().disconnects >= 1, true)
+})
+
+test('an old observer cannot inject text or end a new connection with the same turn label', async t => {
+  const fx = setup(t)
+  await fx.controller.toggle()
+  const old = fx.observers[0]!
+  fx.controller.stop()
+  await fx.controller.toggle()
+  fx.start('same-turn')
+  old.onTextDelta('same-turn', '过时内容。')
+  old.onTurnEnd('same-turn', { ok: true, text: '过时内容。' })
+  fx.text('same-turn', '当前内容。')
+  await advance(t)
+  assert.deepEqual(fx.spoken, ['当前内容。'])
+})
+
+
+test('manually sending or clearing a staged draft removes its old speech from later acknowledgement decisions', async t => {
+  const fx = setup(t, { decide: async state => ({ action: state.assistantSpeaking ? 'backchannel' : 'wait', revision: state.revision }) })
+  await fx.controller.toggle()
+  await final(fx, '这是通过键盘手动发送的问题', 'question')
+  await advance(t, 100)
+  fx.edit('') // native submit clears the composer
+  fx.start('manual-send')
+  fx.text('manual-send', '这是主模型的回答。')
+  await advance(t)
+  await final(fx, '嗯', 'ack')
+  await advance(t, 100)
+  assert.equal(fx.decisions.at(-1)?.transcript, '嗯')
+  assert.equal(fx.counts().resumes, 1)
+  assert.equal(fx.counts().audioCancels, 0)
+})
+
+test('an older empty draft snapshot cannot erase newly captured input after a native submission', async t => {
+  const fx = setup(t, { action: 'wait' })
+  await fx.controller.toggle()
+  await final(fx, '新捕获的下一句话', 'next')
+  fx.controller.bindDraft({ getDraft: () => '', getDraftRev: () => 0, setDraft() {} })
+  await advance(t, 100)
+  assert.equal(fx.controller.getSnapshot().transcript, '新捕获的下一句话')
+  assert.equal(fx.draft(), '新捕获的下一句话')
+})
+
+test('a delayed final for an earlier utterance preserves the newer utterance partial', async t => {
+  const fx = setup(t, { action: 'wait' })
+  await fx.controller.toggle()
+  fx.callbacks.onSpeechStart?.({ utteranceId: 'one' })
+  fx.callbacks.onPartialTranscript?.('第一段', { utteranceId: 'one' })
+  fx.callbacks.onSpeechEnd?.({ utteranceId: 'one' })
+  fx.callbacks.onSpeechStart?.({ utteranceId: 'two' })
+  fx.callbacks.onPartialTranscript?.('第二段还在说', { utteranceId: 'two' })
+  await fx.callbacks.onTranscript?.('第一段完成', { utteranceId: 'one' })
+  await advance(t, 100)
+  assert.equal(fx.controller.getSnapshot().transcript, '第一段完成\n第二段还在说')
+  assert.equal(fx.decisions.at(-1)?.isFinal, false)
+})
+
+
+test('a model retry replaces an in-flight speech request without muting replacement audio', async t => {
+  let rejectFirst!: (error: Error) => void
+  const fx = setup(t, {
+    speak: async text => {
+      if (text === '被模型重试替换的内容。') await new Promise<void>((_resolve, reject) => { rejectFirst = reject })
+    },
+    cancelSpeech: () => { rejectFirst?.(new Error('语音已被替换')) },
+  })
+  await fx.controller.toggle()
+  fx.start('retry-turn')
+  fx.text('retry-turn', '被模型重试替换的内容。')
+  await advance(t)
+  fx.observers.at(-1)!.onTextReset?.('retry-turn', 'retry')
+  fx.text('retry-turn', '新的正确回答。')
+  fx.end('retry-turn', '新的正确回答。')
+  await advance(t)
+  assert.deepEqual(fx.spoken, ['被模型重试替换的内容。', '新的正确回答。'])
+  assert.equal(fx.counts().audioCancels, 1)
+  assert.doesNotMatch(fx.controller.getSnapshot().detail, /播报失败/)
+  fx.finishAudio()
+  await advance(t)
+  assert.equal(fx.controller.getSnapshot().playback, 'idle')
+  assert.equal(fx.controller.getSnapshot().mainBusy, false)
+})
+
+test('a new utterance onset cancels unheard proactive TTS before any transcript update', async t => {
+  const fx = setup(t, { action: 'interject', autoAudio: false })
+  await fx.controller.toggle()
+  fx.callbacks.onSpeechStart?.({ utteranceId: 'original' })
+  fx.callbacks.onPartialTranscript?.('那个服务', { utteranceId: 'original' })
+  fx.callbacks.onPartialTranscript?.('那个服务部署时', { utteranceId: 'original' })
+  await advance(t, 200)
+  fx.start('clarification')
+  fx.text('clarification', '你指的是哪个服务？')
+  await advance(t)
+  fx.callbacks.onSpeechStart?.({ utteranceId: 'new-utterance' })
+  assert.equal(fx.delegated[0]?.signal.aborted, true)
+  assert.equal(fx.counts().audioCancels, 1)
+  assert.equal(fx.controller.getSnapshot().transcript, '那个服务部署时')
+  fx.callbacks.onState('speaking')
+  assert.equal(fx.controller.getSnapshot().playback, 'idle')
+  assert.equal(fx.controller.getSnapshot().transcript, '那个服务部署时')
+})
+
+test('the same approved utterance may continue overlapping its proactive question', async t => {
+  const fx = setup(t, { action: 'interject', autoAudio: false })
+  await fx.controller.toggle()
+  fx.callbacks.onSpeechStart?.({ utteranceId: 'same' })
+  fx.callbacks.onPartialTranscript?.('那个服务', { utteranceId: 'same' })
+  fx.callbacks.onPartialTranscript?.('那个服务部署时', { utteranceId: 'same' })
+  await advance(t, 200)
+  fx.start('clarification')
+  fx.text('clarification', '你指的是哪个服务？')
+  await advance(t)
+  fx.callbacks.onSpeechStart?.({ utteranceId: 'same' })
+  assert.equal(fx.delegated[0]?.signal.aborted, false)
+  assert.equal(fx.counts().audioCancels, 0)
+  assert.equal(fx.counts().pauses, 0)
+  fx.callbacks.onState('speaking')
+  assert.equal(fx.controller.getSnapshot().playback, 'playing')
+  assert.equal(fx.controller.getSnapshot().transcript, '')
+})
+
+
+test('a short correction awaiting its HTTP final cannot submit older completed speech', async t => {
+  const fx = setup(t)
+  await fx.controller.toggle()
+  await final(fx, '帮我查询上海天气', 'first')
+  fx.callbacks.onSpeechStart?.({ utteranceId: 'correction' })
+  fx.callbacks.onSpeechEnd?.({ utteranceId: 'correction' })
+  // No partial exists for this short utterance. Its final arrives after the
+  // semantic-end timer, as happens with the HTTP ASR path.
+  await advance(t, 100)
+  assert.equal(fx.decisions.at(-1)?.isFinal, false)
+  assert.deepEqual(fx.submitted, [])
+  await advance(t, 500)
+  assert.deepEqual(fx.submitted, [])
+  await fx.callbacks.onTranscript?.('不对，是北京', { utteranceId: 'correction' })
+  await advance(t, 100)
+  assert.deepEqual(fx.submitted, ['帮我查询上海天气\n不对，是北京'])
+})
+
+test('an utterance awaiting its final can still interrupt playback from a partial', async t => {
+  const fx = setup(t, { action: 'interrupt' })
+  await fx.controller.toggle()
+  fx.start('manual')
+  fx.text('manual', '这是原来的回答。')
+  await advance(t)
+  fx.callbacks.onSpeechStart?.({ utteranceId: 'new' })
+  fx.callbacks.onPartialTranscript?.('不对，我想说的是', { utteranceId: 'new' })
+  await advance(t, 200)
+  assert.equal(fx.decisions.at(-1)?.isFinal, false)
+  assert.equal(fx.counts().audioCancels, 1)
+  assert.equal(fx.counts().taskCancels, 0)
+  assert.deepEqual(fx.submitted, [])
+})

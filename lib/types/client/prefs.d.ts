@@ -1,11 +1,15 @@
-export type VoiceProviderId = 'qwen' | 'openai';
+export type VoiceProviderId = 'qwen';
+export type SpeechService = 'token-plan' | 'dashscope';
 export type QwenRegion = 'cn-beijing' | 'ap-southeast-1';
 export interface VoicePrefs {
     provider: VoiceProviderId;
+    speechService: SpeechService;
+    decisionEnabled: boolean;
+    decisionModel: string;
+    decisionTimeoutMs: number;
+    proactiveEnabled: boolean;
     qwenWorkspaceId: string;
     qwenRegion: QwenRegion;
-    qwenModel: string;
-    qwenVoice: string;
     qwenAsrModel: string;
     qwenTtsModel: string;
     qwenTtsVoice: string;
@@ -16,14 +20,8 @@ export interface VoicePrefs {
     voiceDraftDwellMs: number;
     voiceDraftAllowWithoutVoiceprint: boolean;
     voiceDraftSensitiveDeny: boolean;
-    floorDelayMs: number;
-    floorComposerEnabled: boolean;
-    qwenFloorModel: string;
-    openaiFloorModel: string;
     voiceprintEnabled: boolean;
     voiceprintThreshold: number;
-    openaiModel: string;
-    openaiVoice: string;
     instructions: string;
 }
 export declare function loadPrefs(): VoicePrefs;

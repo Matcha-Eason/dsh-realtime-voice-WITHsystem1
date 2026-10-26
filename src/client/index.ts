@@ -1,15 +1,14 @@
-import type { Context, RpcApi } from './context-types.ts'
+import type { Context } from './context-types.ts'
 import { HarnessBridge } from './harness-delegate.ts'
 import { VoiceController } from './controller.ts'
 import { MicButton, SettingsCard, VoiceStatus } from './components.tsx'
 import { hydrateFromHost } from './prefs.ts'
 
 export const name = 'dsh-realtime-voice-client'
-export const inject = ['slots', 'connection']
+export const inject = ['slots', 'sessions']
 
 export function apply(ctx: Context): void {
-  const api = (ctx as unknown as { connection: { api: RpcApi } }).connection.api
-  const bridge = new HarnessBridge(api)
+  const bridge = new HarnessBridge(ctx.sessions)
   const controllers = new Map<string, VoiceController>()
   // Pull prefs persisted on the host (settings document) into this browser's
   // localStorage cache on startup, and push this browser's values up when the
@@ -44,13 +43,13 @@ export function apply(ctx: Context): void {
     inject: (sessionId: string) => ({ controller: controllerFor(sessionId) }),
   }, VoiceStatus)), 'dsh-realtime-voice: status dock')
 
-  ctx.effect(() => ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
-    name: 'settings.plugin.item',
+  ctx.effect(() => ctx.slots.inject('settings.plugins.tab', () => ctx.slots.register({
+    name: 'settings.plugins.tab',
     id: 'realtime-voice-settings',
+    label: '实时语音',
     order: 25,
     inject: () => ({}),
   }, SettingsCard)), 'dsh-realtime-voice: settings')
 }
 
 export { HarnessBridge } from './harness-delegate.ts'
-export { parseToolCall, sessionUpdate, toolOutput } from './protocol.ts'

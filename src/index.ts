@@ -3,16 +3,9 @@ import type { Duplex } from 'node:stream'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import z from '@deepseek-ai/schemastery'
 import { HttpError, isLoopbackRequest, readJsonBody } from './host/security.ts'
-import {
-  exchangeOpenAiSdp,
-  exchangeQwenSdp,
-  parseSignalRequest,
-  type Provider,
-  type SignalRequest,
-} from './host/signaling.ts'
 import { QwenSpeechProxy } from './host/qwen-speech-proxy.ts'
 import { TencentVoiceprintClient, validVoiceprintAudio, validVoiceprintId } from './host/tencent-voiceprint.ts'
-import { cleanFloorTopic, composeFloorText, validateFloorCue, type FloorProvider, type FloorStage } from './host/floor-composer.ts'
+import { decideTurn, parseTurnDecisionState } from './host/turn-decision.ts'
 import { VOICE_OUTPUT_CONTEXT } from './voice-contract.ts'
 
 export const name = 'dsh-realtime-voice'
@@ -70,60 +63,60 @@ interface HostContext {
 }
 
 export interface HostDependencies {
-  exchangeOpenAi(request: SignalRequest, key: string, signal: AbortSignal): Promise<string>
-  exchangeQwen(request: SignalRequest, key: string, signal: AbortSignal): Promise<string>
+  decideTurn: typeof decideTurn
   voiceprintEnroll(audio: string, secretId: string, secretKey: string, signal: AbortSignal): Promise<string>
   voiceprintVerify(audio: string, voiceprintId: string, secretId: string, secretKey: string, signal: AbortSignal): Promise<{ decision: boolean; score: number }>
   voiceprintDelete(voiceprintId: string, secretId: string, secretKey: string, signal: AbortSignal): Promise<void>
-  composeFloor(input: Parameters<typeof composeFloorText>[0], key: string, signal: AbortSignal): Promise<string>
 }
 
 const voiceprintClient = new TencentVoiceprintClient()
 const productionDependencies: HostDependencies = {
-  exchangeOpenAi: exchangeOpenAiSdp,
-  exchangeQwen: exchangeQwenSdp,
+  decideTurn,
   voiceprintEnroll: async (audio, secretId, secretKey, signal) => await voiceprintClient.enroll(audio, { secretId, secretKey }, signal),
   voiceprintVerify: async (audio, voiceprintId, secretId, secretKey, signal) => await voiceprintClient.verify(audio, voiceprintId, { secretId, secretKey }, signal),
   voiceprintDelete: async (voiceprintId, secretId, secretKey, signal) => await voiceprintClient.delete(voiceprintId, { secretId, secretKey }, signal),
-  composeFloor: composeFloorText,
 }
 
 const DEFAULT_INSTRUCTIONS = '请用自然、简洁、适合口语播报的中文表达，并允许用户随时打断。'
 
 const prefsSchema = z.object({
   provider: z.string().default('qwen'),
-  qwenWorkspaceId: z.string().default(''),
+  speechService: z.string().default('token-plan'),
+  qwenWorkspaceId: z.string().default('token-plan'),
   qwenRegion: z.string().default('cn-beijing'),
-  qwenModel: z.string().default('qwen3.5-omni-plus-realtime'),
-  qwenVoice: z.string().default('Tina'),
-  qwenAsrModel: z.string().default('qwen3-asr-flash-realtime'),
-  qwenTtsModel: z.string().default('qwen3-tts-flash-realtime'),
-  qwenTtsVoice: z.string().default('Chelsie'),
+  qwenAsrModel: z.string().default('qwen-audio-3.0-asr-flash'),
+  qwenTtsModel: z.string().default('qwen-audio-3.0-tts-plus'),
+  qwenTtsVoice: z.string().default('longanlingxin'),
   qwenVadThreshold: z.number().default(0.85),
   qwenSilenceMs: z.number().default(700),
-  qwenMergeMs: z.number().default(1200),
+  qwenMergeMs: z.number().default(400),
   voiceDraftAutoSend: z.boolean().default(true),
-  voiceDraftDwellMs: z.number().default(1800),
-  voiceDraftAllowWithoutVoiceprint: z.boolean().default(false),
+  voiceDraftDwellMs: z.number().default(700),
+  voiceDraftAllowWithoutVoiceprint: z.boolean().default(true),
   voiceDraftSensitiveDeny: z.boolean().default(true),
-  floorDelayMs: z.number().default(800),
-  floorComposerEnabled: z.boolean().default(true),
-  qwenFloorModel: z.string().default('qwen3.5-flash'),
-  openaiFloorModel: z.string().default('gpt-5-mini'),
+  decisionModel: z.string().default('decision-model-preview'),
+  decisionEnabled: z.boolean().default(true),
+  proactiveEnabled: z.boolean().default(true),
+  decisionTimeoutMs: z.number().default(2000),
   voiceprintEnabled: z.boolean().default(false),
   voiceprintThreshold: z.number().default(75),
   voiceprintId: z.string().default(''),
-  openaiModel: z.string().default('gpt-realtime-2.1'),
-  openaiVoice: z.string().default('marin'),
   instructions: z.string().default(DEFAULT_INSTRUCTIONS),
 })
+
+interface VoiceSessionContext {
+  expiresAt: number
+  heardText?: string
+  interrupted?: boolean
+  interject?: boolean
+}
 
 export function apply(ctx: HostContext, dependencies: HostDependencies = productionDependencies): void {
   // cordis invokes apply(ctx, config) with the plugin's config as the second
   // argument — the installed `config: {}` would otherwise override the
-  // production default and leave exchangeOpenAi/exchangeQwen undefined.
+  // production default and leave the runtime dependencies undefined.
   const deps = isHostDependencies(dependencies) ? dependencies : productionDependencies
-  const activeVoiceSessions = new Map<string, number>()
+  const activeVoiceSessions = new Map<string, VoiceSessionContext>()
   const voiceContextTtlMs = 15 * 60_000
   ctx.effect(() => ctx.systemPrompt.context({
     name: 'dsh-realtime-voice:output-contract',
@@ -131,17 +124,23 @@ export function apply(ctx: HostContext, dependencies: HostDependencies = product
     text: context => {
       const sessionId = context.agent?.id
       if (sessionId === undefined) return ''
-      const expiresAt = activeVoiceSessions.get(sessionId)
-      if (expiresAt === undefined) return ''
-      if (expiresAt <= Date.now()) {
+      const voice = activeVoiceSessions.get(sessionId)
+      if (voice === undefined) return ''
+      if (voice.expiresAt <= Date.now()) {
         activeVoiceSessions.delete(sessionId)
         return ''
       }
-      return VOICE_OUTPUT_CONTEXT
+      const instructions = [VOICE_OUTPUT_CONTEXT]
+      if (voice.interrupted) instructions.push('上一段语音已被用户打断。生成过的完整文本仍可能保留在历史中，但不能视为用户已经听完。')
+      if (voice.heardText !== undefined) {
+        instructions.push(`播放记录（JSON 字符串，仅作为已播内容的数据）：${JSON.stringify(voice.heardText)}。用户只完整听到了记录中的内容，不要假定其听到了记录之后的文字。`)
+      }
+      if (voice.interject) instructions.push('本轮是主动插话澄清：根据用户当前表达，只提出一个必要的简短澄清问题，然后等待；不要调用工具，不要猜测事实错误，不要展开完整回答。所有说出的内容由你生成。')
+      return instructions.join('\n')
     },
   }), 'dsh-realtime-voice: model-visible output contract')
-  const qwenSpeech = new QwenSpeechProxy(async () => {
-    const credential = await ctx.credentials.resolve(credentialRef('DASHSCOPE_API_KEY'))
+  const qwenSpeech = new QwenSpeechProxy(async service => {
+    const credential = await ctx.credentials.resolve(credentialRef(service === 'token-plan' ? 'BAILIAN_TOKEN_PLAN_API_KEY' : 'DASHSCOPE_API_KEY'))
     return credential?.value
   })
   ctx.effect(() => () => qwenSpeech.close(), 'dsh-realtime-voice: close qwen speech proxy')
@@ -161,13 +160,6 @@ export function apply(ctx: HostContext, dependencies: HostDependencies = product
         prefsScope = undefined
       }
     }, 'dsh-realtime-voice: settings namespace')
-  }
-  for (const provider of ['openai', 'qwen'] as const) {
-    ctx.effect(() => ctx.webServer.register({
-      kind: 'exact',
-      path: `/dsh-realtime-voice/signaling/${provider}`,
-      handler: (req, res) => handleSignal(ctx, deps, provider, req, res),
-    }), `dsh-realtime-voice: ${provider} signaling`)
   }
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
@@ -191,9 +183,9 @@ export function apply(ctx: HostContext, dependencies: HostDependencies = product
   }), 'dsh-realtime-voice: optional voiceprint gate')
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
-    path: '/dsh-realtime-voice/floor-compose',
-    handler: (req, res) => handleFloorCompose(ctx, deps, () => prefsScope, req, res),
-  }), 'dsh-realtime-voice: dynamic floor composer')
+    path: '/dsh-realtime-voice/decide',
+    handler: (req, res) => handleDecision(ctx, deps, () => prefsScope, req, res),
+  }), 'dsh-realtime-voice: turn decisions')
   for (const kind of ['asr', 'tts'] as const) {
     ctx.effect(() => ctx.webServer.registerUpgrade({
       path: `/dsh-realtime-voice/${kind}/qwen`,
@@ -204,7 +196,7 @@ export function apply(ctx: HostContext, dependencies: HostDependencies = product
 }
 
 async function handleVoiceContext(
-  activeVoiceSessions: Map<string, number>,
+  activeVoiceSessions: Map<string, VoiceSessionContext>,
   ttlMs: number,
   req: IncomingMessage,
   res: ServerResponse,
@@ -214,10 +206,13 @@ async function handleVoiceContext(
     if (!isLoopbackRequest(req)) throw new HttpError(403, 'loopback same-origin request required')
     const body = await readJsonBody(req)
     if (typeof body !== 'object' || body === null || Array.isArray(body)) throw new HttpError(400, 'context body must be an object')
-    const { sessionId, active } = body as Record<string, unknown>
+    const { sessionId, active, heardText, interrupted, interject } = body as Record<string, unknown>
     if (typeof sessionId !== 'string' || sessionId.trim() === '' || sessionId.length > 256) throw new HttpError(400, 'invalid sessionId')
     if (typeof active !== 'boolean') throw new HttpError(400, 'active must be boolean')
-    if (active) activeVoiceSessions.set(sessionId, Date.now() + ttlMs)
+    if (heardText !== undefined && (typeof heardText !== 'string' || heardText.length > 2000)) throw new HttpError(400, 'invalid heardText')
+    if (interrupted !== undefined && typeof interrupted !== 'boolean') throw new HttpError(400, 'interrupted must be boolean')
+    if (interject !== undefined && typeof interject !== 'boolean') throw new HttpError(400, 'interject must be boolean')
+    if (active) activeVoiceSessions.set(sessionId, { expiresAt: Date.now() + ttlMs, heardText, interrupted, interject })
     else activeVoiceSessions.delete(sessionId)
     sendJson(res, 200, { ok: true })
   } catch (error) {
@@ -229,93 +224,50 @@ async function handleVoiceContext(
 
 export function isHostDependencies(value: unknown): value is HostDependencies {
   return typeof value === 'object' && value !== null
-    && typeof (value as HostDependencies).exchangeOpenAi === 'function'
-    && typeof (value as HostDependencies).exchangeQwen === 'function'
+    && typeof (value as HostDependencies).decideTurn === 'function'
     && typeof (value as HostDependencies).voiceprintEnroll === 'function'
     && typeof (value as HostDependencies).voiceprintVerify === 'function'
     && typeof (value as HostDependencies).voiceprintDelete === 'function'
-    && typeof (value as HostDependencies).composeFloor === 'function'
 }
 
-async function handleFloorCompose(
+async function handleDecision(
   ctx: HostContext,
   dependencies: HostDependencies,
   getScope: () => SettingsScope<unknown> | undefined,
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
+  const controller = new AbortController()
+  const disconnected = () => controller.abort(new Error('decision client disconnected'))
+  req.once('aborted', disconnected)
+  res.once('close', disconnected)
   try {
     if (req.method !== 'POST') throw new HttpError(405, 'method not allowed')
     if (!isLoopbackRequest(req)) throw new HttpError(403, 'loopback same-origin request required')
-    const stored = asRecord(getScope()?.get())
-    if (stored.floorComposerEnabled === false) throw new HttpError(409, 'dynamic floor composer is disabled')
-    const body = asRecord(await readJsonBody(req, 16_000))
-    const provider: FloorProvider = body.provider === 'openai' ? 'openai' : 'qwen'
-    const stage = body.stage
-    if (stage !== 'ack' && stage !== 'tool' && stage !== 'retry' && stage !== 'long-wait') throw new HttpError(400, 'invalid floor stage')
-    const topic = cleanFloorTopic(body.task)
-    if (topic === '') throw new HttpError(422, 'no safe floor topic')
-    const previousCues = Array.isArray(body.previousCues)
-      ? body.previousCues.slice(-3).map(item => validateFloorCue(item)).filter((item): item is string => item !== undefined)
-      : []
-    const ref = credentialRef(provider === 'qwen' ? 'DASHSCOPE_API_KEY' : 'OPENAI_API_KEY')
-    const credential = await ctx.credentials.resolve(ref)
-    if (credential === undefined || credential.value.trim() === '') throw new HttpError(502, `${ref} is not configured`)
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(new Error('floor composer timeout')), 1_500)
-    req.once('aborted', () => controller.abort(new Error('floor composer client disconnected')))
-    try {
-      const cue = await dependencies.composeFloor({
-        provider,
-        workspaceId: typeof stored.qwenWorkspaceId === 'string' ? stored.qwenWorkspaceId : '',
-        region: stored.qwenRegion === 'ap-southeast-1' ? 'ap-southeast-1' : 'cn-beijing',
-        model: provider === 'qwen'
-          ? (typeof stored.qwenFloorModel === 'string' ? stored.qwenFloorModel : 'qwen3.5-flash')
-          : (typeof stored.openaiFloorModel === 'string' ? stored.openaiFloorModel : 'gpt-5-mini'),
-        topic,
-        stage: stage as FloorStage,
-        previousCues,
-      }, credential.value, controller.signal)
-      const safe = validateFloorCue(cue)
-      if (safe === undefined) throw new Error('floor provider returned unsafe text')
-      sendJson(res, 200, { cue: safe })
-    } finally {
-      clearTimeout(timer)
-    }
+    const body = await readJsonBody(req, 64_000)
+    let state: ReturnType<typeof parseTurnDecisionState>
+    try { state = parseTurnDecisionState(body) }
+    catch { throw new HttpError(400, 'invalid turn decision state') }
+    const stored = sanitizePrefs(getScope()?.get())
+    if (stored.decisionEnabled === false) throw new HttpError(409, 'turn decisions are disabled')
+    if (req.aborted || res.destroyed) controller.abort(new Error('decision client disconnected'))
+    controller.signal.throwIfAborted()
+    const credential = await ctx.credentials.resolve(credentialRef('BAILIAN_TOKEN_PLAN_API_KEY'))
+    if (credential === undefined || !credential.value.trim()) throw new HttpError(502, 'Token Plan decision credential is not configured')
+    controller.signal.throwIfAborted()
+    const result = await dependencies.decideTurn(state, credential.value, controller.signal, {
+      model: stored.decisionModel as string,
+      timeoutMs: stored.decisionTimeoutMs as number,
+    })
+    controller.signal.throwIfAborted()
+    sendJson(res, 200, result)
   } catch (error) {
+    if (controller.signal.aborted || res.destroyed || res.writableEnded) return
     const status = error instanceof HttpError ? error.status : 502
-    sendJson(res, status, { error: status === 502 ? 'floor composer unavailable' : error instanceof Error ? error.message : 'floor composer failed' })
-  }
-}
-
-async function handleSignal(
-  ctx: HostContext,
-  dependencies: HostDependencies,
-  provider: Provider,
-  req: IncomingMessage,
-  res: ServerResponse,
-): Promise<void> {
-  try {
-    if (req.method !== 'POST') throw new HttpError(405, 'method not allowed')
-    if (!isLoopbackRequest(req)) throw new HttpError(403, 'loopback same-origin request required')
-    const body = parseSignalRequest(await readJsonBody(req), provider)
-    const ref = credentialRef(provider === 'openai' ? 'OPENAI_API_KEY' : 'DASHSCOPE_API_KEY')
-    const credential = await ctx.credentials.resolve(ref)
-    if (credential === undefined || credential.value.trim() === '') throw new HttpError(502, `${ref} is not configured`)
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(new Error('signaling timeout')), 20_000)
-    try {
-      const answer = provider === 'openai'
-        ? await dependencies.exchangeOpenAi(body, credential.value, controller.signal)
-        : await dependencies.exchangeQwen(body, credential.value, controller.signal)
-      sendText(res, 200, answer, 'application/sdp')
-    } finally {
-      clearTimeout(timer)
-    }
-  } catch (error) {
-    const status = error instanceof HttpError ? error.status : 502
-    const message = error instanceof Error ? error.message : 'signaling failed'
-    sendJson(res, status, { error: message })
+    sendJson(res, status, { error: status === 502 ? 'turn decision service unavailable' : error instanceof HttpError ? error.message : 'turn decision failed' })
+  } finally {
+    req.off('aborted', disconnected)
+    res.off('close', disconnected)
   }
 }
 
@@ -327,15 +279,15 @@ async function handleStatus(
 ): Promise<void> {
   if (req.method !== 'GET') return sendJson(res, 405, { error: 'method not allowed' })
   if (!isLoopbackRequest(req)) return sendJson(res, 403, { error: 'loopback same-origin request required' })
-  const [openai, qwen, tencentId, tencentKey] = await Promise.all([
-    ctx.credentials.describe(credentialRef('OPENAI_API_KEY')),
+  const [tokenPlan, qwen, tencentId, tencentKey] = await Promise.all([
+    ctx.credentials.describe(credentialRef('BAILIAN_TOKEN_PLAN_API_KEY')),
     ctx.credentials.describe(credentialRef('DASHSCOPE_API_KEY')),
     ctx.credentials.describe(credentialRef('TENCENT_SECRET_ID')),
     ctx.credentials.describe(credentialRef('TENCENT_SECRET_KEY')),
   ])
   const stored = asRecord(getScope()?.get())
   sendJson(res, 200, {
-    openai: { configured: openai.configured },
+    tokenPlan: { configured: tokenPlan.configured },
     qwen: { configured: qwen.configured },
     voiceprint: {
       configured: tencentId.configured && tencentKey.configured,
@@ -444,31 +396,29 @@ async function handlePrefs(
 function sanitizePrefs(value: unknown): Record<string, unknown> {
   const source = typeof value === 'object' && value !== null ? value as Record<string, unknown> : {}
   const text = (v: unknown, max: number) => typeof v === 'string' ? v.slice(0, max) : ''
-  const qwenMergeMs = numberInRange(source.qwenMergeMs, 100, 5000, 1200)
+  const qwenMergeMs = numberInRange(source.qwenMergeMs, 100, 5000, 400)
+  const speechService = source.speechService === 'dashscope' ? 'dashscope' : 'token-plan'
   return {
-    provider: source.provider === 'openai' ? 'openai' : 'qwen',
-    qwenWorkspaceId: text(source.qwenWorkspaceId, 128),
-    qwenRegion: source.qwenRegion === 'ap-southeast-1' ? 'ap-southeast-1' : 'cn-beijing',
-    qwenModel: text(source.qwenModel, 128) || 'qwen3.5-omni-plus-realtime',
-    qwenVoice: text(source.qwenVoice, 128) || 'Tina',
-    qwenAsrModel: text(source.qwenAsrModel, 128) || 'qwen3-asr-flash-realtime',
-    qwenTtsModel: text(source.qwenTtsModel, 128) || 'qwen3-tts-flash-realtime',
-    qwenTtsVoice: text(source.qwenTtsVoice, 128) || 'Chelsie',
+    provider: 'qwen',
+    speechService,
+    qwenWorkspaceId: speechService === 'token-plan' ? 'token-plan' : text(source.qwenWorkspaceId, 128),
+    qwenRegion: speechService === 'dashscope' && source.qwenRegion === 'ap-southeast-1' ? 'ap-southeast-1' : 'cn-beijing',
+    qwenAsrModel: text(source.qwenAsrModel, 128) || 'qwen-audio-3.0-asr-flash',
+    qwenTtsModel: text(source.qwenTtsModel, 128) || 'qwen-audio-3.0-tts-plus',
+    qwenTtsVoice: text(source.qwenTtsVoice, 128) || 'longanlingxin',
     qwenVadThreshold: numberInRange(source.qwenVadThreshold, -1, 1, 0.85),
     qwenSilenceMs: numberInRange(source.qwenSilenceMs, 200, 6000, 700),
     qwenMergeMs,
     voiceDraftAutoSend: source.voiceDraftAutoSend !== false,
-    voiceDraftDwellMs: Math.max(qwenMergeMs, numberInRange(source.voiceDraftDwellMs, 500, 6000, 1800)),
-    voiceDraftAllowWithoutVoiceprint: source.voiceDraftAllowWithoutVoiceprint === true,
+    voiceDraftDwellMs: Math.max(qwenMergeMs, numberInRange(source.voiceDraftDwellMs, 500, 6000, 700)),
+    voiceDraftAllowWithoutVoiceprint: source.voiceDraftAllowWithoutVoiceprint !== false,
     voiceDraftSensitiveDeny: source.voiceDraftSensitiveDeny !== false,
-    floorDelayMs: numberInRange(source.floorDelayMs, 400, 3000, 800),
-    floorComposerEnabled: source.floorComposerEnabled !== false,
-    qwenFloorModel: text(source.qwenFloorModel, 128) || 'qwen3.5-flash',
-    openaiFloorModel: text(source.openaiFloorModel, 128) || 'gpt-5-mini',
+    decisionModel: text(source.decisionModel, 128) || 'decision-model-preview',
+    decisionEnabled: source.decisionEnabled !== false,
+    proactiveEnabled: source.proactiveEnabled !== false,
+    decisionTimeoutMs: Math.round(numberInRange(source.decisionTimeoutMs, 250, 10000, 2000)),
     voiceprintEnabled: source.voiceprintEnabled === true,
     voiceprintThreshold: numberInRange(source.voiceprintThreshold, 0, 100, 75),
-    openaiModel: text(source.openaiModel, 128) || 'gpt-realtime-2.1',
-    openaiVoice: text(source.openaiVoice, 128) || 'marin',
     instructions: text(source.instructions, 12_000) || DEFAULT_INSTRUCTIONS,
   }
 }
@@ -482,17 +432,12 @@ function numberInRange(value: unknown, min: number, max: number, fallback: numbe
 }
 
 function sendJson(res: ServerResponse, status: number, value: unknown): void {
-  sendText(res, status, JSON.stringify(value), 'application/json; charset=utf-8')
-}
-
-function sendText(res: ServerResponse, status: number, body: string, contentType: string): void {
   res.writeHead(status, {
-    'Content-Type': contentType,
+    'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
   })
-  res.end(body)
+  res.end(JSON.stringify(value))
 }
 
 export { isLoopbackRequest, readJsonBody } from './host/security.ts'
-export { normalizeSdp, parseSignalRequest, qwenEndpoint } from './host/signaling.ts'

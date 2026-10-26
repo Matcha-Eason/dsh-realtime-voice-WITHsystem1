@@ -1,3 +1,6 @@
 node_modules/
 lib/**/*.map
 *.tgz
+.env*
+!.env.example
+.local/

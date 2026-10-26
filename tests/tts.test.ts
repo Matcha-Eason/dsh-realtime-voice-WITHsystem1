@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { isLikelyTtsEcho, LocalBargeInGate, QwenPipelineConnection, splitForTts } from '../src/client/qwen-pipeline.ts'
+import { isLikelyTtsEcho, QwenPipelineConnection, splitForTts } from '../src/client/qwen-pipeline.ts'
 import type { VoicePrefs } from '../src/client/prefs.ts'
 
 test('TTS chunks remove code and remain below the weighted limit', () => {
@@ -25,27 +25,12 @@ test('TTS echo is rejected while distinct speech remains distinct', () => {
   assert.equal(isLikelyTtsEcho('停止', speech), false)
 })
 
-test('local barge-in requires playback warmup and 500ms sustained near-field audio', () => {
-  const gate = new LocalBargeInGate()
-  const loud = pcm(2_000, 1_600) // 100ms at 16kHz
-  const quiet = pcm(100, 1_600)
-  assert.equal(gate.push(loud, 100).forward, false)
-  assert.equal(gate.push(quiet, 400).forward, false)
-  for (let elapsed = 400; elapsed < 800; elapsed += 100) assert.equal(gate.push(loud, elapsed).forward, false)
-  const confirmed = gate.push(loud, 800)
-  assert.equal(confirmed.forward, true)
-  assert.equal(confirmed.preRoll.length > 1, true)
-  assert.equal(gate.push(loud, 900).forward, true)
-  gate.reset()
-  assert.equal(gate.push(loud, 900).forward, false)
-})
-
 test('TTS rechecks the speech generation between text chunks', async () => {
   const originalWebSocket = globalThis.WebSocket
   class WebSocketState { static readonly OPEN = 1 }
   Object.defineProperty(globalThis, 'WebSocket', { configurable: true, value: WebSocketState })
   try {
-    const connection = new QwenPipelineConnection(prefs(), { onState() {}, async onToolCall() {} })
+    const connection = new QwenPipelineConnection(prefs(), { onState() {} })
     const internals = connection as unknown as {
       tts?: WebSocket
       ttsReady?: Promise<void>
@@ -54,6 +39,7 @@ test('TTS rechecks the speech generation between text chunks', async () => {
     let commits = 0
     internals.tts = {
       readyState: WebSocketState.OPEN,
+      close() {},
       send(raw: string) {
         const event = JSON.parse(raw) as { type?: string }
         if (event.type !== 'input_text_buffer.commit') return
@@ -98,10 +84,4 @@ function prefs(): VoicePrefs {
     openaiVoice: 'marin',
     instructions: '',
   }
-}
-
-function pcm(amplitude: number, samples: number): Int16Array {
-  const output = new Int16Array(samples)
-  output.fill(amplitude)
-  return output
 }

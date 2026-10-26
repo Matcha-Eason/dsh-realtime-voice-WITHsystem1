@@ -1,20 +1,28 @@
-import { HarnessBridge, type DelegateResult, type TextResetReason } from './harness-delegate.ts'
-import { FloorManager } from './floor-manager.ts'
-import { resolveDynamicFloorCue } from './floor-composer.ts'
+import { HarnessBridge, type DelegateResult } from './harness-delegate.ts'
 import { loadPrefs, type VoicePrefs } from './prefs.ts'
-import { RealtimeConnection, type RealtimeCallbacks, type TranscriptMeta } from './realtime.ts'
-import type { ToolCall } from './protocol.ts'
+import type { RealtimeCallbacks, TranscriptMeta } from './realtime.ts'
 import { QwenPipelineConnection } from './qwen-pipeline.ts'
-import { TurnCoordinator, type TurnPhase } from './turn-coordinator.ts'
+import type { TurnPhase } from './turn-coordinator.ts'
 import { VoiceSummaryStream } from './voice-summary.ts'
+import { TURN_ACTIONS, type TurnDecision, type TurnDecisionState } from '../turn-decision.ts'
 
 export type VoiceState = 'idle' | 'connecting' | 'listening' | 'speaking' | 'working' | 'error'
-export interface VoiceSnapshot { state: VoiceState; detail: string; provider: 'qwen' | 'openai' }
+export interface VoiceSnapshot {
+  state: VoiceState
+  detail: string
+  provider: 'qwen'
+  userSpeaking: boolean
+  mainBusy: boolean
+  playback: 'idle' | 'playing' | 'paused'
+  transcript: string
+}
 export interface VoiceConnection {
   connect(): Promise<void>
   disconnect(): void
   speak?(text: string): Promise<void>
   waitForSpeechIdle?(): Promise<void>
+  pauseSpeech?(): void
+  resumeSpeech?(): void
   cancelSpeech?(): void
   setInputPhase?(phase: TurnPhase): void
 }
@@ -26,803 +34,623 @@ export interface VoiceDraftTarget {
   setDraft(text: string): void
   submit?(): void
 }
+export type DecideTurn = (state: TurnDecisionState, signal: AbortSignal) => Promise<TurnDecision>
 
-interface ObservedSpeech {
-  harnessTurn: string
-  turnId: number
+interface SpeechOutput {
+  turn: string
   source: VoiceConnection
-  summary: VoiceSummaryStream
-  floor: FloorManager
-  speechQueue: Promise<void>
-  speechCancelled: boolean
-  speechError?: unknown
-  speechGeneration: number
-  visibleTextSeen: boolean
+  stream: VoiceSummaryStream
+  pending: string[]
+  draining: boolean
+  speechRevision: number
+  muted: boolean
+  done: boolean
+}
+interface Interjection {
+  text: string
+  utteranceId?: string
+  abort: AbortController
+  delivered: boolean
 }
 
-interface DraftAutoSendLease {
-  source: VoiceConnection
-  expectedDraft: string
-  expectedDraftRev?: number
-  generation: number
-}
-
+/** Owns turn decisions and draft ownership; capture, generation and playback may overlap. */
 export class VoiceController {
   private connection?: VoiceConnection
-  private snapshot: VoiceSnapshot = { state: 'idle', detail: '', provider: loadPrefs().provider }
+  private epoch = 0
   private readonly listeners = new Set<() => void>()
-  private taskAbort?: AbortController
-  private connectionEpoch = 0
-  private transcriptTimer?: ReturnType<typeof setTimeout>
-  private transcriptSource?: VoiceConnection
-  private transcriptSegments: string[] = []
-  private transcriptWasBusy = false
-  private transcriptCapturedWhileBusy = false
-  private transcriptVoiceprint: TranscriptMeta['voiceprint']
-  private draftTarget?: VoiceDraftTarget
-  private boundDraft = ''
-  private boundDraftRev?: number
-  private pluginDraftWritePending = false
-  private deferredDraft = ''
-  private draftAutoSendLease?: DraftAutoSendLease
-  private draftAutoSendTimer?: ReturnType<typeof setTimeout>
-  private draftCommitTimer?: ReturnType<typeof setTimeout>
-  private draftSpeechResumeTimer?: ReturnType<typeof setTimeout>
-  private draftSpeechActive = false
-  private draftAutoSendGeneration = 0
-  private readonly turns = new TurnCoordinator()
-  private composerOnly = false
+  private snapshot: VoiceSnapshot = { state: 'idle', detail: '', provider: 'qwen', userSpeaking: false, mainBusy: false, playback: 'idle', transcript: '' }
   private stopObserving?: () => void
-  private voiceContextTimer?: ReturnType<typeof setInterval>
-  private observedSpeech?: ObservedSpeech
-  private nativeSubmitPending = false
-  private nativeSubmitTimer?: ReturnType<typeof setTimeout>
-  private nativeSubmittedTask = ''
+  private contextTimer?: ReturnType<typeof setInterval>
+  private draft?: VoiceDraftTarget
+  private boundDraft = ''
+  private draftRev?: number
+  private writingDraft = false
+  private ownsDraft = false
+  private finals: string[] = []
+  private partial = ''
+  private stablePartial = ''
+  private partialId?: string
+  private consumedPrefix?: { id?: string; text: string }
+  private readonly finalIds = new Set<string>()
+  private readonly pendingFinals = new Set<string | undefined>()
+  private revision = 0
+  private speechActive = false
+  private output?: SpeechOutput
+  private heardText = ''
+  private interrupted = false
+  private playback: VoiceSnapshot['playback'] = 'idle'
+  private nativePending = false
+  private submitTimer?: ReturnType<typeof setTimeout>
+  private decisionTimer?: ReturnType<typeof setTimeout>
+  private decisionAbort?: AbortController
+  private decisionDirty = false
+  private interjection?: Interjection
+  private lastInterjectionAt = -Infinity
+  private voiceprint: TranscriptMeta['voiceprint']
 
   constructor(
     readonly sessionId: string,
     private readonly bridge: HarnessBridge,
-    private readonly createConnection: VoiceConnectionFactory = (prefs, callbacks) => prefs.provider === 'qwen'
-      ? new QwenPipelineConnection(prefs, callbacks)
-      : new RealtimeConnection(prefs, callbacks),
+    private readonly createConnection: VoiceConnectionFactory = (prefs, callbacks) => new QwenPipelineConnection(prefs, callbacks),
+    private readonly decide: DecideTurn = requestTurnDecision,
   ) {}
 
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener)
     return () => this.listeners.delete(listener)
   }
-
   getSnapshot = (): VoiceSnapshot => this.snapshot
 
   bindDraft(target: VoiceDraftTarget): () => void {
-    const current = target.getDraft()
-    const currentRev = target.getDraftRev?.()
-    // React rebinds this adapter after every composer render. A value equal to
-    // boundDraft is our own expected write; a mismatch is a real user edit,
-    // paste or clear and revokes the ASR-owned auto-send lease.
-    if (current !== this.boundDraft) {
-      this.disarmDraftAutoSend('输入框已由你修改；自动发送已取消')
-      this.boundDraft = current
-      this.boundDraftRev = currentRev
-      this.pluginDraftWritePending = false
-    } else if (currentRev !== undefined && this.boundDraftRev !== undefined && currentRev !== this.boundDraftRev) {
-      if (!this.pluginDraftWritePending) this.disarmDraftAutoSend('输入框已由你修改；自动发送已取消')
-      this.boundDraftRev = currentRev
-      this.pluginDraftWritePending = false
-      if (this.draftAutoSendLease !== undefined) this.draftAutoSendLease.expectedDraftRev = currentRev
-    } else if (this.boundDraftRev === undefined) {
-      this.boundDraftRev = currentRev
+    const value = target.getDraft()
+    const rev = target.getDraftRev?.()
+    // A delayed React snapshot cannot revoke a newer voice write or restore
+    // the empty draft from the preceding native submission.
+    if (rev !== undefined && this.draftRev !== undefined && rev < this.draftRev) return () => {}
+    const ownWrite = this.writingDraft && value === this.boundDraft
+    if (ownWrite) {
+      this.writingDraft = false
+    } else if (value !== this.boundDraft || (rev !== undefined && this.draftRev !== undefined && rev !== this.draftRev)) {
+      this.ownsDraft = false
+      this.writingDraft = false
+      this.invalidateDecision()
+      this.cancelUnheardInterjection()
+      if (value === '' && this.boundDraft !== '') {
+        this.finals = []
+        this.partial = ''
+        this.stablePartial = ''
+        this.partialId = undefined
+        this.consumedPrefix = undefined
+        this.voiceprint = undefined
+      }
     }
-    this.draftTarget = target
-    if (this.deferredDraft !== '') {
-      this.appendToDraft(this.deferredDraft)
-      this.deferredDraft = ''
-    }
-    return () => { if (this.draftTarget === target) this.draftTarget = undefined }
+    this.boundDraft = value
+    this.draftRev = rev
+    this.draft = target
+    return () => { if (this.draft === target) this.draft = undefined }
   }
 
   async toggle(): Promise<void> {
-    if (this.connection !== undefined) return this.stop()
-    if (new URLSearchParams(location.search).has('dsh-desktop-platform')) {
-      this.setState('error', '桌面壳暂不开放麦克风；正在用默认浏览器打开同一会话')
-      window.open(location.href.replace(/([?&])dsh-desktop-platform=[^&]*&?/, '$1').replace(/[?&]$/, ''), '_blank', 'noopener')
-      return
-    }
-    const prefs = loadPrefs()
-    this.snapshot = { state: 'connecting', detail: '', provider: prefs.provider }
-    this.emit()
-    const epoch = ++this.connectionEpoch
-    let connection!: VoiceConnection
-    connection = this.createConnection(prefs, {
+    if (this.connection) return this.stop()
+    const epoch = ++this.epoch
+    this.publish('connecting', '正在连接语音服务')
+    let source!: VoiceConnection
+    source = this.createConnection(loadPrefs(), {
       onState: (state, detail) => {
-        if (this.connection !== connection) return
-        if (state === 'speaking' && this.turns.phase === 'tts-pending') this.setTurnPhase(this.turns.turnId, 'tts-speaking')
-        if (state === 'listening' && this.turns.phase !== 'listening' && this.turns.phase !== 'endpoint-candidate') return
-        if (this.taskAbort === undefined) this.setState(state, detail ?? '')
+        if (this.connection !== source || this.epoch !== epoch) return
+        if (state === 'error') { this.publish('error', detail ?? '语音连接失败'); return }
+        if (state === 'speaking') {
+          if (!this.output || this.output.muted || this.output.source !== source) return
+          const candidate = this.interjection
+          if (candidate && !candidate.delivered) {
+            if (candidate.abort.signal.aborted || this.transcript() !== candidate.text) { this.cancelUnheardInterjection(); return }
+            candidate.delivered = true
+            if (this.partial) this.consumedPrefix = { id: this.partialId, text: this.partial }
+            this.discardOwnedInput()
+            this.playback = 'playing'
+          } else {
+            this.playback = this.speechActive ? 'paused' : 'playing'
+            if (this.speechActive) source.pauseSpeech?.()
+          }
+        }
+        this.publish(state === 'connecting' ? 'connecting' : undefined, detail)
       },
-      onToolCall: call => this.handleToolCall(connection, call),
-      onSpeechStart: () => this.handleSpeechStart(connection),
-      onSpeechEnd: () => this.handleSpeechEnd(connection),
-      onTranscript: (text, meta) => this.turns.enqueue(() => this.bufferTranscript(connection, text, meta)),
+      onSpeechStart: meta => {
+        if (this.connection !== source || this.epoch !== epoch) return
+        this.pendingFinals.add(meta?.utteranceId)
+        this.speechActive = true
+        const candidate = this.interjection
+        const continuingInterjection = candidate !== undefined && !candidate.delivered
+          && meta?.utteranceId !== undefined && meta.utteranceId === candidate.utteranceId
+        if (candidate && !candidate.delivered && !continuingInterjection) this.cancelUnheardInterjection()
+        if (continuingInterjection) {
+          source.resumeSpeech?.()
+        } else if (this.output && !this.output.muted) {
+          source.pauseSpeech?.()
+          this.playback = 'paused'
+        }
+        this.invalidateDecision()
+        this.publish(undefined, '正在听你说')
+      },
+      onSpeechEnd: () => {
+        if (this.connection !== source || this.epoch !== epoch) return
+        this.speechActive = false
+        this.invalidateDecision()
+        this.scheduleDecision(loadPrefs().qwenMergeMs)
+        this.publish()
+      },
+      onPartialTranscript: (text, meta) => {
+        if (this.epoch === epoch) this.receivePartial(source, text, meta)
+      },
+      onTranscript: async (text, meta) => {
+        if (this.epoch === epoch) this.receiveFinal(source, text, meta)
+      },
+      onPlaybackProgress: text => {
+        if (this.connection !== source || this.epoch !== epoch) return
+        this.heardText = `${this.heardText}${text}`.slice(-2000)
+      },
     })
-    this.connection = connection
+    this.connection = source
     try {
-      if (prefs.provider === 'qwen') {
-        const enabled = this.enableNativeComposer(connection)
-        this.composerOnly = typeof enabled === 'boolean' ? enabled : await enabled
-      }
-      await connection.connect()
+      this.stopObserving = this.bridge.observeSession(this.sessionId, {
+        onTurnStart: turn => { if (this.epoch === epoch) this.beginOutput(source, turn) },
+        onTextDelta: (turn, delta) => {
+          if (this.connection !== source || this.epoch !== epoch) return
+          if (this.output?.turn === turn && !this.output.muted) this.output.stream.push(delta)
+        },
+        onTextReset: (turn, reason) => {
+          if (this.connection !== source || this.epoch !== epoch) return
+          const output = this.output
+          if (!output || output.turn !== turn || output.muted) return
+          if (reason === 'retry') {
+            output.speechRevision++
+            output.pending = []
+            source.cancelSpeech?.()
+            if (this.playback !== 'paused') this.playback = 'idle'
+          }
+          output.stream = this.createSpeechStream(output)
+        },
+        onTurnEnd: (turn, result) => {
+          if (this.connection === source && this.epoch === epoch) this.finishOutput(turn, result)
+        },
+      })
+      await this.bridge.setVoiceMode(this.sessionId, true)
+      if (this.connection !== source || this.epoch !== epoch) return
+      await source.connect()
+      if (this.connection !== source || this.epoch !== epoch) { source.disconnect(); return }
+      this.contextTimer = setInterval(() => {
+        void this.bridge.setVoiceMode(this.sessionId, true, undefined, { heardText: this.heardText, interrupted: this.interrupted, interject: !!this.interjection }).catch(() => {
+          if (this.connection === source) this.publish(undefined, '语音上下文更新失败，请检查 Harness 连接')
+        })
+      }, 10 * 60_000)
+      this.publish(undefined, '开始说话，完整表达后自动发送')
     } catch (error) {
-      this.disableNativeComposer()
-      connection.disconnect()
-      if (this.connectionEpoch !== epoch || this.connection !== connection) return
-      this.connection = undefined
-      this.setState('error', error instanceof Error ? error.message : String(error))
+      if (this.connection !== source || this.epoch !== epoch) return
+      this.stop()
+      this.publish('error', error instanceof Error ? error.message : '语音连接失败')
     }
   }
 
   stop(): void {
-    this.connectionEpoch++
-    this.turns.invalidate()
-    this.disarmDraftAutoSend()
-    this.flushBufferedTranscriptToDraft()
-    this.taskAbort?.abort()
-    this.taskAbort = undefined
-    this.clearNativeSubmitPending()
-    this.disableNativeComposer()
-    this.cancelObservedSpeech()
-    const connection = this.connection
-    this.connection = undefined
-    connection?.disconnect()
-    this.setState('idle', '')
-  }
-
-  dispose(): void { this.stop(); this.listeners.clear() }
-
-  private async bufferTranscript(source: VoiceConnection, transcript: string, meta: TranscriptMeta = {}): Promise<void> {
-    if (this.connection !== source) return
-    const segment = transcript.trim()
-    if (segment === '') return
-    if (this.transcriptSource !== undefined && this.transcriptSource !== source) this.flushBufferedTranscriptToDraft()
-    this.transcriptSource = source
-    this.transcriptSegments.push(segment)
-    const capturedWhileBusy = meta.capturedWhileBusy === true
-    const wasBusy = capturedWhileBusy
-      || this.hasPendingDraft()
-      || this.nativeSubmitPending
-      || this.taskAbort !== undefined
-      || (this.turns.phase !== 'listening' && this.turns.phase !== 'endpoint-candidate')
-    this.transcriptWasBusy ||= wasBusy
-    this.transcriptCapturedWhileBusy ||= capturedWhileBusy
-    if (meta.voiceprint === 'rejected' || meta.voiceprint === 'unavailable') this.transcriptVoiceprint = meta.voiceprint
-    else if (meta.voiceprint === 'approved' && this.transcriptVoiceprint === undefined) this.transcriptVoiceprint = 'approved'
-    if (!wasBusy && this.turns.phase === 'listening') this.setTurnPhase(this.turns.turnId, 'endpoint-candidate')
-    if (this.transcriptTimer !== undefined) clearTimeout(this.transcriptTimer)
-    this.transcriptTimer = setTimeout(() => {
-      this.transcriptTimer = undefined
-      const wasBusy = this.transcriptWasBusy
-      const capturedWhileBusy = this.transcriptCapturedWhileBusy
-      const voiceprint = this.transcriptVoiceprint
-      const combined = this.takeBufferedTranscript()
-      if (combined !== '') void this.turns.enqueue(() => this.composerOnly
-        ? wasBusy ? this.stageComposerTranscript(source, combined, { capturedWhileBusy, voiceprint }) : this.submitComposerTranscript(source, combined)
-        : wasBusy ? this.handleBusyTranscript(source, combined) : this.handleTranscript(source, combined))
-    }, loadPrefs().qwenMergeMs)
-  }
-
-  private async handleToolCall(source: VoiceConnection, call: ToolCall): Promise<unknown> {
-    if (this.connection !== source) return { ok: false, error: '语音连接已关闭' }
-    if (call.name === 'cancel_harness_task') {
-      this.disarmDraftAutoSend()
-      this.taskAbort?.abort()
-      const cancelled = await this.bridge.cancel(this.sessionId)
-      if (this.connection === source) {
-        this.invalidateCurrentTurn(source)
-        this.setState('listening', cancelled ? 'Harness 任务已取消' : '没有正在执行的 Harness 任务')
-      }
-      return { ok: true, cancelled }
-    }
-    let task = ''
-    try {
-      const args = JSON.parse(call.arguments) as { task?: unknown }
-      if (typeof args.task === 'string') task = args.task.trim()
-    } catch { /* validated below */ }
-    if (task === '') return { ok: false, error: 'delegate_to_harness 缺少 task' }
-    this.setState('working', task.slice(0, 100))
-    const taskAbort = new AbortController()
-    this.taskAbort = taskAbort
-    const result = await this.bridge.delegate(this.sessionId, task, taskAbort.signal)
-    if (this.taskAbort === taskAbort) this.taskAbort = undefined
-    if (this.connection === source) this.setState('listening', result.ok ? 'Harness 已完成' : result.error)
-    return result
-  }
-
-  private async handleTranscript(source: VoiceConnection, transcript: string): Promise<void> {
-    if (this.connection !== source) return
-    const task = transcript.trim()
-    if (task === '') return
-    // A background utterance must never kill a Harness turn that is already
-    // using tools. Only an explicit spoken cancel command may do that. General
-    // barge-in remains available while TTS is speaking, after the Harness turn
-    // has completed.
-    if (this.taskAbort !== undefined) {
-      if (isExplicitCancel(task)) {
-        this.disarmDraftAutoSend()
-        const active = this.taskAbort
-        active.abort()
-        const cancelled = await this.bridge.cancel(this.sessionId)
-        if (this.taskAbort === active) this.taskAbort = undefined
-        if (this.connection === source) {
-          this.invalidateCurrentTurn(source)
-          this.setState('listening', cancelled ? 'Harness 任务已取消' : '没有正在执行的 Harness 任务')
-        }
-      } else {
-        this.appendToDraft(task)
-        this.setState('working', '继续任务：新语音已转成文字；发送后排队处理，也可以直接清空')
-      }
-      return
-    }
-    // ASR remains open while Harness/TTS works so genuine barge-in stays
-    // possible. Before audio has actually started, however, a late/background
-    // final must not preempt the answer that is about to play.
-    if (this.turns.phase === 'tts-pending' || this.turns.phase === 'tts-speaking' || this.turns.phase === 'post-playback') {
-      this.appendToDraft(task)
-      this.setState(this.turns.phase === 'tts-speaking' ? 'speaking' : 'working', '继续任务：新语音已保留在输入框；发送后处理，或直接清空')
-      return
-    }
-    const turnId = this.turns.begin()
-    this.setTurnPhase(turnId, 'harness')
-    this.setState('working', task.slice(0, 100))
-    const taskAbort = new AbortController()
-    this.taskAbort = taskAbort
-    void this.runHarnessTurn(source, task, turnId, taskAbort).catch(error => {
-      if (this.connection !== source || !this.turns.isCurrent(turnId)) return
-      this.setTurnPhase(turnId, 'listening')
-      this.setState('error', error instanceof Error ? error.message : String(error))
-    })
-  }
-
-  private async handleBusyTranscript(source: VoiceConnection, transcript: string): Promise<void> {
-    if (this.connection !== source) return
-    const task = transcript.trim()
-    if (task === '') return
-    if (this.taskAbort !== undefined && isExplicitCancel(task)) {
-      this.disarmDraftAutoSend()
-      await this.handleTranscript(source, task)
-      return
-    }
-    this.appendToDraft(task)
-    const playback = this.turns.phase === 'tts-speaking' || this.turns.phase === 'post-playback'
-    this.setState(playback ? 'speaking' : this.taskAbort !== undefined ? 'working' : 'listening', '继续任务：新语音已保留在输入框；发送后处理，或直接清空')
-  }
-
-  private stageComposerTranscript(source: VoiceConnection, transcript: string, meta: TranscriptMeta = {}): void {
-    if (this.connection !== source) return
-    this.appendToDraft(transcript)
-    this.armDraftAutoSend(source, meta)
-    if (this.turns.phase === 'endpoint-candidate') this.setTurnPhase(this.turns.turnId, 'listening')
-    if (this.turns.phase === 'listening') this.updateDraftAutoSendStatus()
-  }
-
-  private submitComposerTranscript(source: VoiceConnection, transcript: string): void {
-    if (this.connection !== source) return
-    const target = this.draftTarget
-    if (target?.submit === undefined) {
-      this.stageComposerTranscript(source, transcript)
-      return
-    }
-    this.appendToDraft(transcript)
-    this.submitBoundDraft(source)
-  }
-
-  private submitBoundDraft(source: VoiceConnection): void {
-    if (this.connection !== source) return
-    const target = this.draftTarget
-    const submittedTask = this.boundDraft.trim()
-    if (target?.submit === undefined || submittedTask === '') return
-    this.disarmDraftAutoSend()
-    this.nativeSubmittedTask = submittedTask
-    this.nativeSubmitPending = true
-    this.setState('working', '语音已识别，正在交给 Harness')
-    queueMicrotask(() => {
-      if (this.connection !== source || !this.nativeSubmitPending) return
-      try {
-        target.submit?.()
-        // The native composer clears its draft after submit, but React may not
-        // rebind this target until the next render. Drop our shadow copy now so
-        // speech captured during that gap cannot resurrect the submitted turn.
-        this.boundDraft = ''
-        this.boundDraftRev = undefined
-        this.pluginDraftWritePending = false
-      } catch (error) {
-        this.nativeSubmittedTask = ''
-        this.clearNativeSubmitPending()
-        if (this.turns.phase === 'endpoint-candidate') this.setTurnPhase(this.turns.turnId, 'listening')
-        this.setState('error', `自动发送失败，文字已保留在输入框：${error instanceof Error ? error.message : String(error)}`)
-        return
-      }
-      if (!this.nativeSubmitPending) return
-      this.nativeSubmitTimer = setTimeout(() => {
-        this.nativeSubmitTimer = undefined
-        if (!this.nativeSubmitPending || this.connection !== source) return
-        this.nativeSubmitPending = false
-        this.nativeSubmittedTask = ''
-        if (this.turns.phase === 'endpoint-candidate') this.setTurnPhase(this.turns.turnId, 'listening')
-        this.setState('error', 'Harness 未确认自动发送；请检查输入框后手动发送')
-      }, 10_000)
-    })
-  }
-
-  private enableNativeComposer(source: VoiceConnection): boolean | Promise<boolean> {
-    const bridge = this.bridge as HarnessBridge & Partial<Pick<HarnessBridge, 'observeSession' | 'setVoiceMode'>>
-    if (typeof bridge.observeSession !== 'function' || typeof bridge.setVoiceMode !== 'function') return false
-    this.stopObserving = bridge.observeSession(this.sessionId, {
-      onTurnStart: harnessTurn => this.beginObservedTurn(source, harnessTurn),
-      onTextDelta: (harnessTurn, delta) => this.pushObservedDelta(harnessTurn, delta),
-      onTextReset: (harnessTurn, reason) => this.resetObservedSpeech(harnessTurn, reason),
-      onTurnEnd: (harnessTurn, result) => { void this.finishObservedTurn(harnessTurn, result) },
-    })
-    return bridge.setVoiceMode(this.sessionId, true).then(() => {
-      this.voiceContextTimer = setInterval(() => { void bridge.setVoiceMode?.(this.sessionId, true).catch(() => {}) }, 10 * 60_000)
-      return true
-    })
-  }
-
-  private disableNativeComposer(): void {
-    this.disarmDraftAutoSend()
-    this.draftSpeechActive = false
+    this.epoch++
+    this.invalidateDecision()
+    this.decisionAbort?.abort()
+    this.decisionAbort = undefined
+    this.interjection?.abort.abort()
+    this.interjection = undefined
+    this.clearSubmitTimer()
     this.stopObserving?.()
     this.stopObserving = undefined
-    if (this.voiceContextTimer !== undefined) clearInterval(this.voiceContextTimer)
-    this.voiceContextTimer = undefined
-    this.clearNativeSubmitPending()
-    this.cancelObservedSpeech()
-    if (this.composerOnly) void this.bridge.setVoiceMode?.(this.sessionId, false).catch(() => {})
-    this.composerOnly = false
-    this.nativeSubmittedTask = ''
+    if (this.contextTimer) clearInterval(this.contextTimer)
+    this.contextTimer = undefined
+    this.output = undefined
+    const source = this.connection
+    this.connection = undefined
+    source?.disconnect()
+    if (source) void this.bridge.setVoiceMode(this.sessionId, false).catch(() => {})
+    this.speechActive = false
+    this.playback = 'idle'
+    this.nativePending = false
+    this.finals = []
+    this.partial = ''
+    this.stablePartial = ''
+    this.partialId = undefined
+    this.consumedPrefix = undefined
+    this.finalIds.clear()
+    this.pendingFinals.clear()
+    this.ownsDraft = false
+    this.publish('idle', '')
+  }
+  dispose(): void { this.stop(); this.listeners.clear() }
+
+  private receivePartial(source: VoiceConnection, text: string, meta: TranscriptMeta = {}): void {
+    if (this.connection !== source || (meta.utteranceId && this.finalIds.has(meta.utteranceId))) return
+    text = this.unconsumed(text.trim(), meta.utteranceId)
+    if (this.partial === text && this.partialId === meta.utteranceId) return
+    this.stablePartial = this.partialId === meta.utteranceId ? commonPrefix(this.partial, text) : ''
+    this.partial = text
+    this.partialId = meta.utteranceId
+    this.invalidateDecision()
+    if (this.interjection && !this.interjection.delivered && this.transcript() !== this.interjection.text) this.cancelUnheardInterjection()
+    this.publish()
+    if (this.output || loadPrefs().proactiveEnabled) this.scheduleDecision(200)
   }
 
-  private beginObservedTurn(source: VoiceConnection, harnessTurn: string): void {
-    if (this.connection !== source || !this.composerOnly) return
-    this.disarmDraftAutoSend()
-    this.cancelObservedSpeech()
-    const submittedTask = this.nativeSubmittedTask
-    this.nativeSubmittedTask = ''
-    this.clearNativeSubmitPending()
-    const turnId = this.turns.begin()
-    this.setTurnPhase(turnId, 'harness')
-    this.setState('working', '输入已发送，Harness 正在处理')
-    const observed = {} as ObservedSpeech
-    observed.harnessTurn = harnessTurn
-    observed.turnId = turnId
-    observed.source = source
-    observed.speechQueue = Promise.resolve()
-    observed.speechCancelled = false
-    observed.speechGeneration = 0
-    observed.visibleTextSeen = false
-    const enqueueSpeech = (sentence: string) => {
-      if (source.speak === undefined || observed.speechCancelled) return
-      const generation = observed.speechGeneration
-      if (this.connection === source && this.turns.isCurrent(turnId)) this.setTurnPhase(turnId, 'tts-pending')
-      observed.speechQueue = observed.speechQueue.then(async () => {
-        if (generation !== observed.speechGeneration || observed.speechCancelled || this.connection !== source || !this.turns.isCurrent(turnId)) return
-        await source.speak?.(sentence)
-      }).catch(error => {
-        if (generation !== observed.speechGeneration) return
-        observed.speechError = error
-        observed.speechCancelled = true
-      })
+  private receiveFinal(source: VoiceConnection, text: string, meta: TranscriptMeta = {}): void {
+    if (this.connection !== source) return
+    this.pendingFinals.delete(meta.utteranceId)
+    if (meta.utteranceId) {
+      if (this.finalIds.has(meta.utteranceId)) return
+      this.finalIds.add(meta.utteranceId)
+      if (this.finalIds.size > 128) this.finalIds.delete(this.finalIds.values().next().value!)
     }
-    const floorPrefs = loadPrefs()
-    observed.floor = new FloorManager(floorPrefs.floorDelayMs, enqueueSpeech, {
-      resolveCue: floorPrefs.floorComposerEnabled ? resolveDynamicFloorCue : undefined,
-    })
-    observed.floor.start(submittedTask)
-    observed.summary = new VoiceSummaryStream(sentence => {
-      enqueueSpeech(sentence)
-    })
-    this.observedSpeech = observed
-  }
-
-  private pushObservedDelta(harnessTurn: string, delta: string): void {
-    const observed = this.observedSpeech
-    if (observed?.harnessTurn === harnessTurn) {
-      observed.visibleTextSeen = true
-      observed.floor.resultAvailable()
-      observed.summary.push(delta)
+    text = this.unconsumed(text.trim(), meta.utteranceId)
+    if (!this.partialId || !meta.utteranceId || this.partialId === meta.utteranceId) {
+      this.partial = ''
+      this.stablePartial = ''
+      this.partialId = undefined
     }
-  }
-
-  private resetObservedSpeech(harnessTurn: string, reason: TextResetReason): void {
-    const observed = this.observedSpeech
-    if (observed?.harnessTurn !== harnessTurn) return
-    if (observed.visibleTextSeen) {
-      observed.speechGeneration++
-      observed.source.cancelSpeech?.()
-      observed.speechQueue = Promise.resolve()
-      observed.speechCancelled = false
-      observed.speechError = undefined
-    }
-    observed.visibleTextSeen = false
-    observed.summary = new VoiceSummaryStream(sentence => {
-      if (observed.source.speak === undefined || observed.speechCancelled) return
-      const generation = observed.speechGeneration
-      observed.speechQueue = observed.speechQueue.then(async () => {
-        if (generation !== observed.speechGeneration || observed.speechCancelled || this.connection !== observed.source || !this.turns.isCurrent(observed.turnId)) return
-        await observed.source.speak?.(sentence)
-      }).catch(error => {
-        if (generation !== observed.speechGeneration) return
-        observed.speechError = error
-        observed.speechCancelled = true
-      })
-    })
-    observed.floor.reset(reason)
-    if (this.turns.isCurrent(observed.turnId)) this.setTurnPhase(observed.turnId, 'harness')
-  }
-
-  private async finishObservedTurn(harnessTurn: string, result: DelegateResult): Promise<void> {
-    const observed = this.observedSpeech
-    if (observed?.harnessTurn !== harnessTurn) return
-    observed.floor.dispose()
-    const { source, turnId } = observed
-    const release = () => { if (this.observedSpeech === observed) this.observedSpeech = undefined }
-    if (this.connection !== source || !this.turns.isCurrent(turnId)) {
-      release()
+    this.voiceprint = meta.voiceprint
+    if (meta.likelyEcho || !text) {
+      this.invalidateDecision()
+      if (!this.speechActive) this.resumeOutput()
+      this.publish()
       return
     }
-    if (!result.ok) {
-      this.disarmDraftAutoSend()
-      observed.speechGeneration++
-      observed.source.cancelSpeech?.()
-      this.setTurnPhase(turnId, 'listening')
-      this.setState(result.cancelled === true ? 'listening' : 'error', result.error)
-      release()
+    this.finals.push(text)
+    this.stageDraft(text)
+    this.invalidateDecision()
+    if (this.interjection && !this.interjection.delivered && this.transcript() !== this.interjection.text) this.cancelUnheardInterjection()
+    if (isExplicitCancel(text)) { void this.cancelTask(); return }
+    this.scheduleDecision(loadPrefs().qwenMergeMs)
+    this.publish(undefined, '正在判断是否说完；继续说会合并')
+  }
+
+  private transcript(): string { return [...this.finals, this.partial].filter(Boolean).join('\n') }
+
+  private unconsumed(text: string, id?: string): string {
+    const prefix = this.consumedPrefix
+    if (prefix && prefix.id === id && text.startsWith(prefix.text)) return text.slice(prefix.text.length).trim()
+    return text
+  }
+
+  private stageDraft(text: string): void {
+    const draft = this.draft
+    if (!draft || (draft.getPhase?.() ?? 'plain') !== 'plain') { this.ownsDraft = false; return }
+    const existing = this.writingDraft ? this.boundDraft : draft.getDraft()
+    const canOwn = existing.trim() === '' || (this.ownsDraft && existing === this.boundDraft)
+    this.boundDraft = existing.trimEnd() ? `${existing.trimEnd()}\n${text}` : text
+    this.ownsDraft = canOwn
+    this.writingDraft = true
+    draft.setDraft(this.boundDraft)
+  }
+
+  private invalidateDecision(): void {
+    this.revision++
+    if (this.decisionTimer) clearTimeout(this.decisionTimer)
+    this.decisionTimer = undefined
+    this.decisionDirty = false
+  }
+
+  private scheduleDecision(delay: number): void {
+    if (!this.connection) return
+    if (this.decisionTimer) clearTimeout(this.decisionTimer)
+    this.decisionTimer = setTimeout(() => {
+      this.decisionTimer = undefined
+      void this.evaluateTurn()
+    }, delay)
+  }
+
+  private async evaluateTurn(): Promise<void> {
+    const source = this.connection
+    if (!source) return
+    if (this.decisionAbort) { this.decisionDirty = true; return }
+    const transcript = this.transcript()
+    if (!transcript) {
+      if (!this.speechActive) this.resumeOutput()
       return
     }
-    try {
-      observed.summary.finish(result.text)
-      await observed.speechQueue
-      await source.waitForSpeechIdle?.()
-      if (observed.speechError !== undefined && !isBargeInError(observed.speechError)) throw observed.speechError
-      if (this.connection !== source || !this.turns.isCurrent(turnId)) {
-        release()
-        return
-      }
-      this.setTurnPhase(turnId, 'post-playback')
-      await delay(400)
-      if (this.connection !== source || !this.turns.isCurrent(turnId)) {
-        release()
-        return
-      }
-      this.setTurnPhase(turnId, 'listening')
-      this.setState('listening', isBargeInError(observed.speechError)
-        ? '播报已打断；识别文字保留在输入框'
-        : this.hasPendingDraft()
-          ? 'Harness 已完成；输入框里的后续语音正在等待发送'
-          : 'Harness 已完成；继续说将自动处理')
-      this.scheduleDraftAutoSend()
-      release()
-    } catch (error) {
-      if (this.connection === source && this.turns.isCurrent(turnId)) {
-        this.disarmDraftAutoSend()
-        this.setTurnPhase(turnId, 'listening')
-        this.setState('error', error instanceof Error ? error.message : String(error))
-      }
-      release()
+    const state: TurnDecisionState = {
+      transcript: transcript.slice(-8000),
+      stableText: [...this.finals, this.stablePartial].filter(Boolean).join('\n').slice(-8000),
+      revision: this.revision,
+      isFinal: !this.partial && this.finals.length > 0 && this.pendingFinals.size === 0,
+      userSpeaking: this.speechActive,
+      assistantSpeaking: !!this.output && !this.output.muted,
+      mainBusy: this.isMainBusy(),
+      recentAssistantText: this.heardText,
     }
-  }
-
-  private async runHarnessTurn(source: VoiceConnection, task: string, turnId: number, taskAbort: AbortController): Promise<void> {
-    let speechError: unknown
-    let speechCancelled = false
-    let speechQueue = Promise.resolve()
-    let speechGeneration = 0
-    let visibleTextSeen = false
-    const enqueueSpeech = (sentence: string) => {
-      if (source.speak === undefined) return
-      if (this.connection === source && this.turns.isCurrent(turnId)) this.setTurnPhase(turnId, 'tts-pending')
-      const generation = speechGeneration
-      speechQueue = speechQueue.then(async () => {
-        if (generation !== speechGeneration || speechCancelled || this.connection !== source || !this.turns.isCurrent(turnId)) return
-        await source.speak?.(sentence)
-      }).catch(error => {
-        if (generation !== speechGeneration) return
-        speechError = error
-        speechCancelled = true
-      })
-    }
-    let summary = new VoiceSummaryStream(enqueueSpeech)
-    const floorPrefs = loadPrefs()
-    const floor = new FloorManager(floorPrefs.floorDelayMs, enqueueSpeech, {
-      resolveCue: floorPrefs.floorComposerEnabled ? resolveDynamicFloorCue : undefined,
-    })
-    floor.start(task)
-    const result = await this.bridge.delegate(
-      this.sessionId,
-      task,
-      taskAbort.signal,
-      {
-        voiceOutputContract: true,
-        onTextDelta: delta => { visibleTextSeen = true; floor.resultAvailable(); summary.push(delta) },
-        onTextReset: reason => {
-          if (visibleTextSeen) {
-            speechGeneration++
-            source.cancelSpeech?.()
-            speechQueue = Promise.resolve()
-            speechCancelled = false
-            speechError = undefined
-          }
-          visibleTextSeen = false
-          summary = new VoiceSummaryStream(enqueueSpeech)
-          floor.reset(reason)
-          if (this.turns.isCurrent(turnId)) this.setTurnPhase(turnId, 'harness')
-        },
-      },
-    )
-    floor.dispose()
-    if (this.taskAbort === taskAbort) this.taskAbort = undefined
-    if (this.connection !== source || !this.turns.isCurrent(turnId)) return
-    if (!result.ok) {
-      this.disarmDraftAutoSend()
-      speechGeneration++
-      source.cancelSpeech?.()
-      this.setTurnPhase(turnId, 'listening')
-      this.setState('error', result.error)
-      return
-    }
-    if (source.speak === undefined) {
-      this.disarmDraftAutoSend()
-      this.setTurnPhase(turnId, 'listening')
-      this.setState('error', '当前语音连接没有独立 TTS')
-      return
-    }
-    try {
-      summary.finish(result.text)
-      await speechQueue
-      await source.waitForSpeechIdle?.()
-      if (speechError !== undefined && !isBargeInError(speechError)) throw speechError
-      if (this.connection === source && this.turns.isCurrent(turnId)) {
-        this.setTurnPhase(turnId, 'post-playback')
-        await delay(400)
-        if (this.connection !== source || !this.turns.isCurrent(turnId)) return
-        this.setTurnPhase(turnId, 'listening')
-        this.setState('listening', isBargeInError(speechError)
-          ? '播报已打断；新语音已保留在输入框，可发送或清空'
-          : 'Harness 已完成')
-        this.scheduleDraftAutoSend()
-      }
-    } catch (error) {
-      if (this.connection === source && this.turns.isCurrent(turnId)) {
-        this.disarmDraftAutoSend()
-        this.setTurnPhase(turnId, 'listening')
-        this.setState('error', error instanceof Error ? error.message : String(error))
-      }
-    }
-  }
-
-  private cancelObservedSpeech(): void {
-    const observed = this.observedSpeech
-    if (observed === undefined) return
-    observed.floor?.dispose()
-    observed.speechGeneration++
-    observed.speechCancelled = true
-    observed.source.cancelSpeech?.()
-    this.observedSpeech = undefined
-  }
-
-  private setState(state: VoiceState, detail: string): void {
-    this.snapshot = { state, detail, provider: loadPrefs().provider }
-    this.emit()
-  }
-
-  private emit(): void { this.listeners.forEach(listener => listener()) }
-
-  private setTurnPhase(turnId: number, phase: TurnPhase): void {
-    if (!this.turns.transition(turnId, phase)) return
-    this.connection?.setInputPhase?.(phase)
-  }
-
-  private invalidateCurrentTurn(source: VoiceConnection): void {
-    this.turns.invalidate()
-    source.setInputPhase?.('listening')
-  }
-
-  private takeBufferedTranscript(): string {
-    const combined = this.transcriptSegments.splice(0).join('\n').trim()
-    this.transcriptSource = undefined
-    this.transcriptWasBusy = false
-    this.transcriptCapturedWhileBusy = false
-    this.transcriptVoiceprint = undefined
-    return combined
-  }
-
-  private flushBufferedTranscriptToDraft(): void {
-    if (this.transcriptTimer !== undefined) clearTimeout(this.transcriptTimer)
-    this.transcriptTimer = undefined
-    const combined = this.takeBufferedTranscript()
-    if (combined !== '') this.appendToDraft(combined)
-  }
-
-  private appendToDraft(text: string): string {
-    const addition = text.trim()
-    if (addition === '') return this.boundDraft
-    const target = this.draftTarget
-    if (target === undefined) {
-      this.deferredDraft = joinDraft(this.deferredDraft, addition)
-      return this.deferredDraft
-    }
-    const next = joinDraft(this.boundDraft || target.getDraft(), addition)
-    this.boundDraft = next
-    this.pluginDraftWritePending = true
-    target.setDraft(next)
-    return next
-  }
-
-  private hasPendingDraft(): boolean {
-    if (this.deferredDraft.trim() !== '') return true
-    const target = this.draftTarget
-    return (target?.getDraft() ?? this.boundDraft).trim() !== ''
-  }
-
-  private clearNativeSubmitPending(): void {
-    this.nativeSubmitPending = false
-    this.nativeSubmittedTask = ''
-    if (this.nativeSubmitTimer !== undefined) clearTimeout(this.nativeSubmitTimer)
-    this.nativeSubmitTimer = undefined
-  }
-
-  private armDraftAutoSend(source: VoiceConnection, meta: TranscriptMeta): void {
     const prefs = loadPrefs()
-    const voiceprintBlocked = meta.voiceprint === 'rejected' || meta.voiceprint === 'unavailable'
-    const voiceprintAllowed = prefs.voiceprintEnabled
-      ? meta.voiceprint === 'approved'
-      : prefs.voiceDraftAllowWithoutVoiceprint
-    const continuation = this.draftAutoSendLease?.source === source
-    const task = this.boundDraft.trim()
-    if (!prefs.voiceDraftAutoSend
-      || voiceprintBlocked
-      || !voiceprintAllowed
-      || (!meta.capturedWhileBusy && !continuation)
-      || (prefs.voiceDraftSensitiveDeny && isSensitiveDraft(task))
-      || isExplicitCancel(task)) {
-      this.disarmDraftAutoSend()
+    if (!prefs.decisionEnabled) {
+      if (state.isFinal && !state.userSpeaking && !state.mainBusy && !state.assistantSpeaking) await this.submitDraft(source, state.revision)
       return
     }
-    this.pauseDraftAutoSend()
-    this.draftAutoSendLease = {
-      source,
-      expectedDraft: this.boundDraft,
-      expectedDraftRev: this.pluginDraftWritePending ? undefined : this.boundDraftRev,
-      generation: ++this.draftAutoSendGeneration,
-    }
-    this.scheduleDraftAutoSend()
-  }
-
-  private scheduleDraftAutoSend(): void {
-    this.pauseDraftAutoSend()
-    const lease = this.draftAutoSendLease
-    if (lease === undefined || !this.isDraftAutoSendSafe(lease)) return
-    const dwellMs = loadPrefs().voiceDraftDwellMs
-    const generation = lease.generation
-    this.draftAutoSendTimer = setTimeout(() => {
-      this.draftAutoSendTimer = undefined
-      const current = this.validDraftAutoSendLease(generation)
-      if (current === undefined) {
-        this.disarmDraftAutoSend('输入框或发送状态已变化；自动发送已取消')
-        return
+    const controller = new AbortController()
+    this.decisionAbort = controller
+    try {
+      const decision = await this.decide(state, controller.signal)
+      if (this.connection !== source || controller.signal.aborted || decision.revision !== this.revision) return
+      switch (decision.action) {
+        case 'cancel': await this.cancelTask(); break
+        case 'backchannel':
+          if (state.isFinal && !this.speechActive) { this.discardOwnedInput(); this.resumeOutput() }
+          break
+        case 'interrupt':
+          this.muteOutput()
+          if (state.isFinal && !this.speechActive && !this.isMainBusy()) this.scheduleDecision(0)
+          break
+        case 'submit':
+          if (state.isFinal && !this.speechActive && !this.isMainBusy() && !this.output) await this.submitDraft(source, state.revision)
+          break
+        case 'interject':
+          if (prefs.proactiveEnabled && state.stableText && !this.output && !this.isMainBusy()) void this.startInterjection(source, state)
+          break
+        case 'wait':
+          this.publish(undefined, '继续听；已识别文字保留在输入框')
+          break
       }
-      // Server VAD speech_started can trail the actual acoustic onset. Keep a
-      // short final guard window so a user beginning the next phrase at the
-      // dwell boundary still cancels before submit.
-      this.setState('listening', '后续语音即将发送；继续说仍会合并')
-      this.draftCommitTimer = setTimeout(() => {
-        this.draftCommitTimer = undefined
-        const ready = this.validDraftAutoSendLease(generation)
-        if (ready === undefined) {
-          this.disarmDraftAutoSend('输入框或发送状态已变化；自动发送已取消')
-          return
-        }
-        this.submitBoundDraft(ready.source)
-      }, 450)
-    }, dwellMs)
-    this.updateDraftAutoSendStatus()
-  }
-
-  private isDraftAutoSendSafe(lease: DraftAutoSendLease): boolean {
-    return this.connection === lease.source
-      && this.composerOnly
-      && this.turns.phase === 'listening'
-      && this.taskAbort === undefined
-      && !this.nativeSubmitPending
-      && !this.draftSpeechActive
-      && (this.draftTarget?.getPhase?.() ?? 'plain') === 'plain'
-      && this.draftTarget?.submit !== undefined
-      && lease.expectedDraft.trim() !== ''
-  }
-
-  private pauseDraftAutoSend(): void {
-    if (this.draftAutoSendTimer !== undefined) clearTimeout(this.draftAutoSendTimer)
-    this.draftAutoSendTimer = undefined
-    if (this.draftCommitTimer !== undefined) clearTimeout(this.draftCommitTimer)
-    this.draftCommitTimer = undefined
-    if (this.draftSpeechResumeTimer !== undefined) clearTimeout(this.draftSpeechResumeTimer)
-    this.draftSpeechResumeTimer = undefined
-  }
-
-  private handleSpeechStart(source: VoiceConnection): void {
-    if (this.connection !== source) return
-    this.draftSpeechActive = true
-    const lease = this.draftAutoSendLease
-    this.pauseDraftAutoSend()
-    if (lease === undefined) return
-    this.setState('listening', '检测到你在继续说；等待本句识别后合并')
-  }
-
-  private handleSpeechEnd(source: VoiceConnection): void {
-    if (this.connection !== source) return
-    this.draftSpeechActive = false
-    const lease = this.draftAutoSendLease
-    if (lease === undefined || !this.isDraftAutoSendSafe(lease)) return
-    const resumeMs = Math.max(500, loadPrefs().qwenMergeMs)
-    const generation = lease.generation
-    // Actionable finals normally arrive after speech_stopped and replace this
-    // timer with a fresh merged lease. If the sound was only a cough/filler,
-    // resume after the no-final grace without guessing how long speech lasts.
-    this.draftSpeechResumeTimer = setTimeout(() => {
-      this.draftSpeechResumeTimer = undefined
-      if (this.validDraftAutoSendLease(generation) !== undefined) this.scheduleDraftAutoSend()
-    }, resumeMs)
-  }
-
-  private validDraftAutoSendLease(generation: number): DraftAutoSendLease | undefined {
-    const current = this.draftAutoSendLease
-    const target = this.draftTarget
-    if (current === undefined
-      || current.generation !== generation
-      || !this.isDraftAutoSendSafe(current)
-      || target?.getDraft() !== current.expectedDraft
-      || (current.expectedDraftRev !== undefined && target.getDraftRev?.() !== current.expectedDraftRev)
-      || this.boundDraft !== current.expectedDraft) return undefined
-    return current
-  }
-
-  private disarmDraftAutoSend(detail?: string): void {
-    const hadLease = this.draftAutoSendLease !== undefined
-    this.pauseDraftAutoSend()
-    this.draftAutoSendLease = undefined
-    this.draftAutoSendGeneration++
-    if (detail !== undefined && hadLease && this.connection !== undefined && this.turns.phase === 'listening') {
-      this.setState('listening', detail)
+    } catch (error) {
+      if (this.connection === source && !controller.signal.aborted && state.revision === this.revision) {
+        this.publish(undefined, `轮次判断暂不可用，文字保留待手动发送：${error instanceof Error ? error.message : '请求失败'}`)
+      }
+    } finally {
+      if (this.decisionAbort === controller) this.decisionAbort = undefined
+      if (this.decisionDirty && this.connection === source) { this.decisionDirty = false; this.scheduleDecision(0) }
     }
   }
 
-  private updateDraftAutoSendStatus(): void {
-    const lease = this.draftAutoSendLease
-    if (lease !== undefined && this.isDraftAutoSendSafe(lease)) {
-      const seconds = Math.round(loadPrefs().voiceDraftDwellMs / 100) / 10
-      this.setState('listening', `后续语音已合并；继续说会重新计时，约 ${seconds} 秒后自动发送`)
-      return
+  private draftIsOwned(): boolean {
+    const draft = this.draft
+    if (!draft || !this.ownsDraft || draft.getDraft() !== this.boundDraft || (draft.getPhase?.() ?? 'plain') !== 'plain') return false
+    if (this.writingDraft) {
+      this.writingDraft = false
+      this.draftRev = draft.getDraftRev?.()
     }
-    this.setState('listening', '语音已写入输入框；可继续说、手动发送或清空')
+    return this.draftRev === undefined || draft.getDraftRev?.() === this.draftRev
+  }
+
+  private async submitDraft(source: VoiceConnection, revision: number): Promise<void> {
+    const prefs = loadPrefs()
+    const voiceAllowed = prefs.voiceprintEnabled ? this.voiceprint === 'approved' : prefs.voiceDraftAllowWithoutVoiceprint
+    if (!prefs.voiceDraftAutoSend || !voiceAllowed || this.voiceprint === 'rejected' || this.voiceprint === 'unavailable'
+      || !this.draftIsOwned() || !this.draft?.submit || this.nativePending || this.speechActive || this.pendingFinals.size > 0 || this.isMainBusy()
+      || (prefs.voiceDraftSensitiveDeny && isSensitiveDraft(this.boundDraft))) return
+    this.nativePending = true
+    try {
+      await this.bridge.setVoiceMode(this.sessionId, true, undefined, { heardText: this.heardText, interrupted: this.interrupted })
+      if (this.connection !== source || revision !== this.revision || !this.draftIsOwned() || this.speechActive || this.pendingFinals.size > 0) return
+      // The native submit owns command handling, attachments and queue admission.
+      this.draft!.submit!()
+      this.finals = []
+      this.partial = ''
+      this.stablePartial = ''
+      this.ownsDraft = false
+      this.invalidateDecision()
+      this.publish('working', '已发送给当前主模型')
+      if (this.nativePending) this.submitTimer = setTimeout(() => {
+        this.nativePending = false
+        this.submitTimer = undefined
+        this.publish(undefined, 'Harness 尚未确认发送，请检查输入框')
+      }, 10_000)
+    } catch (error) {
+      this.publish(undefined, `发送失败，文字已保留：${error instanceof Error ? error.message : 'Harness 不可用'}`)
+    } finally {
+      if (!this.submitTimer) this.nativePending = false
+    }
+  }
+
+  private async startInterjection(source: VoiceConnection, state: TurnDecisionState): Promise<void> {
+    if (this.interjection || Date.now() - this.lastInterjectionAt < 8000 || !this.draftIsOwned() && this.boundDraft.trim()) return
+    const candidate: Interjection = { text: this.transcript(), utteranceId: this.partialId, abort: new AbortController(), delivered: false }
+    this.interjection = candidate
+    this.lastInterjectionAt = Date.now()
+    try {
+      await this.bridge.setVoiceMode(this.sessionId, true, candidate.abort.signal, { heardText: this.heardText, interrupted: this.interrupted, interject: true })
+      if (candidate.abort.signal.aborted || this.connection !== source || this.transcript() !== candidate.text || this.isMainBusy()) return
+      this.publish('working', '主模型正在准备简短澄清')
+      const result = await this.bridge.delegate(this.sessionId, state.transcript, candidate.abort.signal)
+      if (!result.ok && !candidate.abort.signal.aborted && this.connection === source) this.publish(undefined, result.error)
+    } catch (error) {
+      if (!candidate.abort.signal.aborted && this.connection === source) this.publish(undefined, `插话准备失败：${error instanceof Error ? error.message : 'Harness 不可用'}`)
+    } finally {
+      if (this.interjection === candidate && (!this.output || this.output.muted)) this.clearInterjectionContext()
+    }
+  }
+
+  private cancelUnheardInterjection(): void {
+    const candidate = this.interjection
+    if (!candidate || candidate.delivered) return
+    candidate.abort.abort()
+    this.clearInterjectionContext()
+    this.muteOutput()
+  }
+
+  private clearInterjectionContext(): void {
+    if (!this.interjection) return
+    this.interjection = undefined
+    const source = this.connection
+    const epoch = this.epoch
+    if (!source) return
+    void this.bridge.setVoiceMode(this.sessionId, true, undefined, { heardText: this.heardText, interrupted: this.interrupted }).catch(() => {
+      if (this.connection === source && this.epoch === epoch) this.publish(undefined, '插话上下文恢复失败，请检查 Harness 连接')
+    })
+  }
+
+  private beginOutput(source: VoiceConnection, turn: string): void {
+    if (this.connection !== source) return
+    this.clearSubmitTimer()
+    this.nativePending = false
+    if (this.output) source.cancelSpeech?.()
+    const output: SpeechOutput = { turn, source, stream: undefined!, pending: [], draining: false, speechRevision: 0, muted: false, done: false }
+    output.stream = this.createSpeechStream(output)
+    this.output = output
+    this.heardText = ''
+    this.interrupted = false
+    this.playback = 'idle'
+    this.invalidateDecision()
+    source.setInputPhase?.('harness')
+    this.publish('working', '当前主模型正在回答')
+  }
+
+  private createSpeechStream(output: SpeechOutput): VoiceSummaryStream {
+    return new VoiceSummaryStream(sentence => {
+      if (this.output !== output || output.muted) return
+      output.pending.push(sentence)
+      void this.drainOutput(output)
+    })
+  }
+
+  private async drainOutput(output: SpeechOutput): Promise<void> {
+    const candidate = this.interjection
+    const interjecting = candidate !== undefined && !candidate.abort.signal.aborted
+    if (output.draining || output.muted || this.output !== output
+      || (this.speechActive && !interjecting) || this.playback === 'paused') return
+    if (candidate && !candidate.delivered) {
+      if (this.transcript() !== candidate.text) { this.cancelUnheardInterjection(); return }
+      // This approved utterance may overlap the user's current speech. Keep
+      // it cancellable until the connection reports its first audio.
+      output.source.resumeSpeech?.()
+    }
+    const speechRevision = output.speechRevision
+    output.draining = true
+    try {
+      while (this.output === output && output.speechRevision === speechRevision && !output.muted && (this.playback as VoiceSnapshot['playback']) !== 'paused'
+        && (!this.speechActive || this.interjection === candidate && interjecting) && output.pending.length) {
+        const sentence = output.pending.shift()!
+        output.source.setInputPhase?.('tts-pending')
+        await output.source.speak?.(sentence)
+      }
+      if (this.output !== output || output.speechRevision !== speechRevision || output.muted) return
+      if (!output.pending.length) {
+        await output.source.waitForSpeechIdle?.()
+        if (this.output !== output || output.speechRevision !== speechRevision || output.muted) return
+        this.playback = 'idle'
+        // New main-model text can arrive while the previous audio drains.
+        // Recheck the queue before retiring a finished generation.
+        if (output.done && !output.pending.length) this.releaseOutput(output)
+      }
+    } catch (error) {
+      // A model retry deliberately cancels the previous TTS generation. Its
+      // rejection must not mute the replacement sentences already queued.
+      if (this.output === output && output.speechRevision === speechRevision && !output.muted) {
+        this.muteOutput()
+        this.publish(undefined, `播报失败：${error instanceof Error ? error.message : 'TTS 不可用'}`)
+      }
+    } finally {
+      output.draining = false
+      if (this.output === output && !output.muted && output.pending.length
+        && (!this.speechActive || this.interjection === candidate && interjecting)) void this.drainOutput(output)
+    }
+  }
+
+  private finishOutput(turn: string, result: DelegateResult): void {
+    const output = this.output
+    if (!output || output.turn !== turn) return
+    output.done = true
+    if (result.ok && !output.muted) output.stream.finish(result.text)
+    else if (!result.ok) {
+      this.muteOutput()
+      if (!result.cancelled) this.publish(undefined, result.error)
+    }
+    if (output.muted || (!output.draining && !output.pending.length && this.playback === 'idle')) this.releaseOutput(output)
+    else void this.drainOutput(output)
+  }
+
+  private releaseOutput(output: SpeechOutput): void {
+    if (this.output !== output) return
+    this.output = undefined
+    this.clearInterjectionContext()
+    this.playback = 'idle'
+    output.source.setInputPhase?.('listening')
+    this.invalidateDecision()
+    this.publish(undefined, '继续说话')
+    if (this.transcript()) this.scheduleDecision(loadPrefs().voiceDraftDwellMs)
+  }
+
+  private muteOutput(): void {
+    const output = this.output
+    if (!output || output.muted) return
+    output.muted = true
+    output.pending = []
+    output.source.cancelSpeech?.()
+    this.interrupted = true
+    this.playback = 'idle'
+    this.invalidateDecision()
+    if (output.done) this.releaseOutput(output)
+    this.publish(undefined, '已停播，继续听你说；后台任务仍由 Harness 管理')
+  }
+
+  private resumeOutput(): void {
+    const output = this.output
+    if (!output || output.muted || this.speechActive) return
+    output.source.resumeSpeech?.()
+    this.playback = 'playing'
+    void this.drainOutput(output)
+    this.publish()
+  }
+
+  private discardOwnedInput(): void {
+    if (this.draftIsOwned()) {
+      this.boundDraft = ''
+      this.writingDraft = true
+      this.draft!.setDraft('')
+    }
+    this.ownsDraft = false
+    this.finals = []
+    this.partial = ''
+    this.stablePartial = ''
+    this.invalidateDecision()
+  }
+
+  private async cancelTask(): Promise<void> {
+    const source = this.connection
+    this.cancelUnheardInterjection()
+    this.muteOutput()
+    this.discardOwnedInput()
+    try {
+      const cancelled = await this.bridge.cancel(this.sessionId)
+      if (this.connection === source) this.publish(undefined, cancelled ? '已请求停止当前任务' : '已停止播报')
+    } catch {
+      if (this.connection === source) this.publish(undefined, '播报已停止；Harness 任务取消失败')
+    }
+  }
+
+  private isMainBusy(): boolean { return this.nativePending || (!!this.output && !this.output.done) || this.bridge.isBusy?.(this.sessionId) === true }
+
+  private clearSubmitTimer(): void {
+    if (this.submitTimer) clearTimeout(this.submitTimer)
+    this.submitTimer = undefined
+  }
+
+  private publish(state?: VoiceState, detail = this.snapshot.detail): void {
+    const busy = this.isMainBusy()
+    this.snapshot = {
+      state: state ?? (this.playback === 'playing' ? 'speaking' : busy ? 'working' : this.connection ? 'listening' : 'idle'),
+      detail, provider: 'qwen', userSpeaking: this.speechActive, mainBusy: busy, playback: this.playback, transcript: this.transcript(),
+    }
+    this.listeners.forEach(listener => listener())
   }
 }
 
+async function requestTurnDecision(state: TurnDecisionState, signal: AbortSignal): Promise<TurnDecision> {
+  const response = await fetch('/dsh-realtime-voice/decide', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(state),
+    signal: AbortSignal.any([signal, AbortSignal.timeout(loadPrefs().decisionTimeoutMs + 500)]),
+  })
+  if (!response.ok) throw new Error(`决策服务 HTTP ${response.status}`)
+  const result = await response.json() as TurnDecision
+  if (!TURN_ACTIONS.includes(result.action) || result.revision !== state.revision) throw new Error('决策响应无效')
+  return result
+}
+
+function commonPrefix(left: string, right: string): string {
+  let index = 0
+  while (index < left.length && left[index] === right[index]) index++
+  return right.slice(0, index)
+}
 function isExplicitCancel(text: string): boolean {
-  const normalized = text.replace(/[\s，。！？,.!?、]/g, '')
-  return /^(停|停止|停下|别说了|取消|取消任务|不要了|算了)$/.test(normalized)
+  return /^(停|停止|停下|别说了|取消|取消任务|停止任务|取消这次任务|不要了|算了)$/.test(text.replace(/[\s，。！？,.!?、]/g, ''))
 }
-
-function isBargeInError(error: unknown): boolean {
-  return error instanceof Error && error.message === '语音播放已被用户打断'
-}
-
 function isSensitiveDraft(text: string): boolean {
   return /(转账|汇款|付款|支付|购买|下单|发送验证码|验证码|密码|删除|清空|卸载|格式化|关机|重启|抹掉|永久)/.test(text)
 }
-
-function joinDraft(existing: string, addition: string): string {
-  const before = existing.trimEnd()
-  return before === '' ? addition : `${before}\n${addition}`
-}
-
-function delay(ms: number): Promise<void> { return new Promise(resolve => setTimeout(resolve, ms)) }
