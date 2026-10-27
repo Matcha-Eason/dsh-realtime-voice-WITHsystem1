@@ -99,3 +99,42 @@ test('empty speech needs no model call and pre-aborted calls never reach the pro
   await assert.rejects(decideTurn(state, 'key', AbortSignal.abort(), { fetch }), { name: 'AbortError' })
   assert.equal(calls, 0)
 })
+
+test('a stalled final retries once within the total deadline and keeps the same snapshot', async t => {
+  const attemptTimeout = new AbortController()
+  const totalTimeout = new AbortController()
+  t.mock.method(AbortSignal, 'timeout', ms => ms === 2000 ? attemptTimeout.signal : totalTimeout.signal)
+  const requests: string[] = []
+  const pending = decideTurn(state, 'key', new AbortController().signal, { fetch: async (_url, init) => {
+    requests.push(String(init?.body))
+    if (requests.length === 1) return await new Promise<Response>((_resolve, reject) => init!.signal!.addEventListener('abort', () => reject(init!.signal!.reason), { once: true }))
+    return new Response(JSON.stringify({ answers: { action: { choice: 'submit' } } }))
+  } })
+  attemptTimeout.abort(new DOMException('Timed out', 'TimeoutError'))
+  assert.deepEqual(await pending, { action: 'submit', revision: state.revision })
+  assert.equal(requests.length, 2)
+  assert.equal(requests[0], requests[1])
+})
+
+test('the final retry cannot outlive the total deadline or caller cancellation', async t => {
+  for (const cancelByCaller of [false, true]) {
+    const attemptTimeout = new AbortController()
+    const totalTimeout = new AbortController()
+    const caller = new AbortController()
+    const timeout = t.mock.method(AbortSignal, 'timeout', ms => ms === 2000 ? attemptTimeout.signal : totalTimeout.signal)
+    let calls = 0
+    let retryStarted!: () => void
+    const retried = new Promise<void>(resolve => { retryStarted = resolve })
+    const pending = decideTurn(state, 'key', caller.signal, { fetch: async (_url, init) => {
+      if (++calls === 2) retryStarted()
+      return await new Promise<Response>((_resolve, reject) => init!.signal!.addEventListener('abort', () => reject(init!.signal!.reason), { once: true }))
+    } })
+    attemptTimeout.abort(new DOMException('Timed out', 'TimeoutError'))
+    await retried
+    if (cancelByCaller) caller.abort()
+    else totalTimeout.abort(new DOMException('Timed out', 'TimeoutError'))
+    await assert.rejects(pending, { name: cancelByCaller ? 'AbortError' : 'TimeoutError' })
+    assert.equal(calls, 2)
+    timeout.mock.restore()
+  }
+})

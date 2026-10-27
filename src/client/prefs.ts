@@ -4,6 +4,7 @@ export type QwenRegion = 'cn-beijing' | 'ap-southeast-1'
 
 export interface VoicePrefs {
   provider: VoiceProviderId
+  asrEngine: 'cloud' | 'local-sensevoice'
   speechService: SpeechService
   decisionEnabled: boolean
   decisionModel: string
@@ -31,9 +32,10 @@ const PREFS_URL = '/dsh-realtime-voice/prefs'
 const DEFAULTS: VoicePrefs = {
   provider: 'qwen',
   speechService: 'token-plan',
+  asrEngine: 'cloud',
   decisionEnabled: true,
   decisionModel: 'decision-model-preview',
-  decisionTimeoutMs: 2000,
+  decisionTimeoutMs: 4000,
   proactiveEnabled: true,
   qwenWorkspaceId: 'token-plan',
   qwenRegion: 'cn-beijing',
@@ -41,8 +43,8 @@ const DEFAULTS: VoicePrefs = {
   qwenTtsModel: 'qwen-audio-3.0-tts-plus',
   qwenTtsVoice: 'longanlingxin',
   qwenVadThreshold: 0.85,
-  qwenSilenceMs: 700,
-  qwenMergeMs: 400,
+  qwenSilenceMs: 400,
+  qwenMergeMs: 600,
   voiceDraftAutoSend: true,
   voiceDraftDwellMs: 700,
   voiceDraftAllowWithoutVoiceprint: true,
@@ -124,6 +126,7 @@ function sanitize(value: VoicePrefs): VoicePrefs {
   const qwenMergeMs = numberInRange(value.qwenMergeMs, 100, 5000, DEFAULTS.qwenMergeMs)
   return {
     provider: 'qwen',
+    asrEngine: value.asrEngine === 'local-sensevoice' ? 'local-sensevoice' : 'cloud',
     speechService: value.speechService === 'dashscope' ? 'dashscope' : 'token-plan',
     decisionEnabled: value.decisionEnabled !== false,
     decisionModel: text(value.decisionModel, 128) || DEFAULTS.decisionModel,

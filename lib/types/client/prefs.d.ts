@@ -3,6 +3,7 @@ export type SpeechService = 'token-plan' | 'dashscope';
 export type QwenRegion = 'cn-beijing' | 'ap-southeast-1';
 export interface VoicePrefs {
     provider: VoiceProviderId;
+    asrEngine: 'cloud' | 'local-sensevoice';
     speechService: SpeechService;
     decisionEnabled: boolean;
     decisionModel: string;

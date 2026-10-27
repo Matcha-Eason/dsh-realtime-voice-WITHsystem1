@@ -141,7 +141,7 @@ test('HTTP ASR stops on provider failure and never exposes a raw response', asyn
   asr.client(input)
   asr.client(input)
   await new Promise(resolve => setImmediate(resolve))
-  assert.deepEqual(emitted.at(-1), { type: 'error', error: { message: 'Qwen ASR recognition failed' } })
+  assert.deepEqual(emitted.at(-1), { type: 'error', error: { message: 'ASR recognition failed' } })
   asr.client(input)
   assert.equal(calls, 1)
 })
@@ -181,7 +181,7 @@ test('HTTP ASR does not hide other 400 responses as silence', async () => {
     asr.client({ type: 'input_audio_buffer.append', audio: pcm.toString('base64') })
     asr.client({ type: 'input_audio_buffer.append', audio: Buffer.alloc(6400).toString('base64') })
     await new Promise(resolve => setImmediate(resolve))
-    assert.deepEqual(emitted.at(-1), { type: 'error', error: { message: 'Qwen ASR recognition failed' } })
+    assert.deepEqual(emitted.at(-1), { type: 'error', error: { message: 'ASR recognition failed' } })
   }
 })
 
@@ -294,4 +294,57 @@ test('local proxy resolves the selected credential and forwards text and audio u
     for (const socket of upstreamServer.clients) socket.terminate()
     await Promise.all([new Promise<void>(resolve => server.close(() => resolve())), new Promise<void>(resolve => upstreamServer.close(() => resolve()))])
   }
+})
+
+test('final ASR aborts an obsolete preview immediately and starts its own request', async () => {
+  const events: Record<string, any>[] = []
+  let count = 0
+  let previewSignal: AbortSignal | undefined
+  const asr = new QwenHttpAsr('qwen-audio-3.0-asr-flash', 'fake', event => events.push(event), async (_url, init) => {
+    count++
+    if (count === 1) {
+      previewSignal = init!.signal as AbortSignal
+      return await new Promise((_resolve, reject) => previewSignal!.addEventListener('abort', () => reject(previewSignal!.reason), { once: true }))
+    }
+    return new Response(JSON.stringify({ text: '完整的用户请求。' }))
+  })
+  asr.client({ type: 'session.update', session: { input_audio_format: 'pcm', sample_rate: 16000, turn_detection: { silence_duration_ms: 400 } } })
+  const speech = Buffer.alloc(32000)
+  for (let i = 0; i < speech.length; i += 2) speech.writeInt16LE(3000, i)
+  for (let i = 0; i < speech.length; i += 3200) asr.client({ type: 'input_audio_buffer.append', audio: speech.subarray(i, i + 3200).toString('base64') })
+  asr.client({ type: 'input_audio_buffer.append', audio: Buffer.alloc(12800).toString('base64') })
+  assert.equal(previewSignal?.aborted, true)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(count, 2)
+  assert.equal(events.at(-1)?.transcript, '完整的用户请求。')
+  assert.equal(events.some(event => event.type === 'error'), false)
+  asr.close()
+})
+
+test('local ASR websocket never resolves credentials or calls cloud recognition', async () => {
+  let prepared = 0, recognized = 0
+  const proxy = new QwenSpeechProxy(
+    async () => { throw new Error('Local ASR must not request cloud credentials') },
+    () => { throw new Error('Local ASR must not connect to cloud') },
+    async () => { throw new Error('Local ASR must not use HTTP') },
+    { async prepare() { prepared++ }, async recognize(pcm, signal) { recognized++; assert.equal(signal.aborted, false); assert.ok(pcm.length); return '本地识别成功。' } },
+  )
+  const server = createServer()
+  server.on('upgrade', (req, socket, head) => { void proxy.handle('asr', req, socket, head) })
+  server.listen(0, '127.0.0.1'); await once(server, 'listening')
+  const address = server.address(); assert.ok(address && typeof address === 'object')
+  const client = new WebSocket(`ws://127.0.0.1:${address.port}/asr?engine=local-sensevoice`)
+  try {
+    await once(client, 'open')
+    const ready = once(client, 'message')
+    client.send(JSON.stringify({ type: 'session.update', session: { input_audio_format: 'pcm', sample_rate: 16000, turn_detection: { silence_duration_ms: 400 } } }))
+    await ready
+    const final = new Promise<Record<string, any>>(resolve => client.on('message', data => { const event = JSON.parse(data.toString()); if (event.transcript) resolve(event) }))
+    const pcm = Buffer.alloc(3200)
+    for (let i = 0; i < pcm.length; i += 2) pcm.writeInt16LE(3000, i)
+    client.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: pcm.toString('base64') }))
+    client.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: Buffer.alloc(12800).toString('base64') }))
+    assert.equal((await final).transcript, '本地识别成功。')
+    assert.equal(prepared, 1); assert.equal(recognized, 1)
+  } finally { client.close(); proxy.close(); await new Promise<void>(resolve => server.close(() => resolve())) }
 })

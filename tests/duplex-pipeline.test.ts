@@ -156,11 +156,11 @@ test('microphone ASR stays continuous through speaking, soft pause and post play
   try {
     await value.connect()
     const capture = FakeAudioContext.instances[0]!
-    const input = { inputBuffer: { getChannelData: () => new Float32Array(2048).fill(0.1) } }
+    const input = { data: new Int16Array(320).fill(3000).buffer }
     for (const phase of ['listening', 'tts-speaking', 'post-playback'] as const) {
       value.setInputPhase(phase)
       if (phase === 'tts-speaking') value.pauseSpeech()
-      capture.processor!.onaudioprocess!(input)
+      FakeWorklet.instances[0]!.port.onmessage!(input)
     }
     assert.equal(frames.length, 3)
     assert.equal(capture.state, 'running')
@@ -297,7 +297,7 @@ class FakeAudioContext {
   sampleRate = 48000
   destination = {}
   sources: FakeSource[] = []
-  processor?: { onaudioprocess?: (event: { inputBuffer: { getChannelData(): Float32Array } }) => void; connect(): void; disconnect(): void }
+  audioWorklet = { async addModule(_url: string) {} }
   constructor() { FakeAudioContext.instances.push(this) }
   createGain() { return { gain: { value: 1 }, connect() {}, disconnect() {} } }
   createBuffer(_channels: number, length: number, sampleRate: number) {
@@ -306,7 +306,6 @@ class FakeAudioContext {
   }
   createBufferSource() { const source = new FakeSource(); this.sources.push(source); return source }
   createMediaStreamSource() { return { connect() {}, disconnect() {} } }
-  createScriptProcessor() { return this.processor = { connect() {}, disconnect() {} } }
   async suspend() { this.state = 'suspended' }
   async resume() { this.state = 'running' }
   async close() { this.state = 'closed' }
@@ -327,7 +326,18 @@ class FakeWebSocket extends EventTarget {
   close() { this.readyState = 3; this.onclose?.() }
 }
 
+class FakeWorklet {
+  static instances: FakeWorklet[] = []
+  port: { onmessage?: ((event: { data: ArrayBuffer }) => void) | null; close(): void } = { close() {} }
+  constructor() { FakeWorklet.instances.push(this) }
+  connect() {}
+  disconnect() {}
+}
+
 function audioGlobals(): () => void {
+  const workletDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'AudioWorkletNode')
+  FakeWorklet.instances = []
+  Object.defineProperty(globalThis, 'AudioWorkletNode', { configurable: true, value: FakeWorklet })
   const audioDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'AudioContext')
   const socketDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'WebSocket')
   FakeAudioContext.instances = []
@@ -335,6 +345,8 @@ function audioGlobals(): () => void {
   Object.defineProperty(globalThis, 'AudioContext', { configurable: true, value: FakeAudioContext })
   Object.defineProperty(globalThis, 'WebSocket', { configurable: true, value: FakeWebSocket })
   return () => {
+    if (workletDescriptor) Object.defineProperty(globalThis, 'AudioWorkletNode', workletDescriptor)
+    else Reflect.deleteProperty(globalThis, 'AudioWorkletNode')
     if (audioDescriptor) Object.defineProperty(globalThis, 'AudioContext', audioDescriptor)
     else Reflect.deleteProperty(globalThis, 'AudioContext')
     if (socketDescriptor) Object.defineProperty(globalThis, 'WebSocket', socketDescriptor)

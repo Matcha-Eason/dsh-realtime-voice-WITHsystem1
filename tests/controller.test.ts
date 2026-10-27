@@ -15,7 +15,7 @@ function setup(t: TestContext, options: {
   cancelSpeech?: () => void
   delegate?: (text: string, signal: AbortSignal) => Promise<DelegateResult>
 } = {}) {
-  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] })
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] })
   const storage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
   Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: { getItem: () => null, setItem() {} } })
   t.mock.method(globalThis, 'fetch', async () => new Response('{}', { status: 200 }))
@@ -450,7 +450,7 @@ test('a short correction awaiting its HTTP final cannot submit older completed s
   // No partial exists for this short utterance. Its final arrives after the
   // semantic-end timer, as happens with the HTTP ASR path.
   await advance(t, 100)
-  assert.equal(fx.decisions.at(-1)?.isFinal, false)
+  assert.equal(fx.decisions.length, 0, 'do not call the model while final is pending')
   assert.deepEqual(fx.submitted, [])
   await advance(t, 500)
   assert.deepEqual(fx.submitted, [])
@@ -472,4 +472,93 @@ test('an utterance awaiting its final can still interrupt playback from a partia
   assert.equal(fx.counts().audioCancels, 1)
   assert.equal(fx.counts().taskCancels, 0)
   assert.deepEqual(fx.submitted, [])
+})
+
+test('endpoint silence and ASR time count toward the continuation window only once', async t => {
+  const fx = setup(t)
+  await fx.controller.toggle()
+  fx.callbacks.onSpeechStart?.({ utteranceId: 'one' })
+  await advance(t, 400)
+  fx.callbacks.onSpeechEnd?.({ utteranceId: 'one', silenceMs: 400 })
+  await advance(t, 150)
+  await fx.callbacks.onTranscript?.('请推荐一种室内活动。', { utteranceId: 'one' })
+  await advance(t)
+  assert.deepEqual(fx.submitted, ['请推荐一种室内活动。'])
+})
+
+test('new transcript aborts the stale decision request instead of waiting for its timeout', async t => {
+  let staleSignal: AbortSignal | undefined
+  const fx = setup(t, { decide: async (state, signal) => {
+    if (!state.isFinal) {
+      staleSignal = signal
+      return await new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }))
+    }
+    return { action: 'submit', revision: state.revision }
+  } })
+  await fx.controller.toggle()
+  fx.callbacks.onSpeechStart?.({ utteranceId: 'one' })
+  fx.callbacks.onPartialTranscript?.('请推荐', { utteranceId: 'one' })
+  fx.callbacks.onPartialTranscript?.('请推荐活动', { utteranceId: 'one' })
+  await advance(t, 200)
+  assert.equal(staleSignal?.aborted, false)
+  fx.callbacks.onSpeechEnd?.({ utteranceId: 'one', silenceMs: 400 })
+  await fx.callbacks.onTranscript?.('请推荐一种室内活动。', { utteranceId: 'one' })
+  await advance(t)
+  await advance(t)
+  assert.equal(staleSignal?.aborted, true)
+  assert.deepEqual(fx.submitted, ['请推荐一种室内活动。'])
+})
+
+test('idle partials wait for stable text before requesting a proactive decision', async t => {
+  const fx = setup(t, { action: 'wait' })
+  await fx.controller.toggle()
+  fx.callbacks.onSpeechStart?.({ utteranceId: 'one' })
+  fx.callbacks.onPartialTranscript?.('那个服务', { utteranceId: 'one' })
+  await advance(t, 200)
+  assert.equal(fx.decisions.length, 0)
+  fx.callbacks.onPartialTranscript?.('那个服务部署时', { utteranceId: 'one' })
+  await advance(t, 200)
+  assert.equal(fx.decisions.length, 1)
+  assert.equal(fx.decisions[0]?.stableText, '那个服务')
+})
+
+test('latency stages cover endpoint through first audio without counting silence twice', async t => {
+  const fx = setup(t, { autoAudio: false, decide: async state => {
+    await new Promise(resolve => setTimeout(resolve, 100))
+    return { action: 'submit', revision: state.revision }
+  } })
+  updatePrefs({ qwenMergeMs: 600 })
+  await fx.controller.toggle()
+  fx.callbacks.onSpeechStart?.({ utteranceId: 'one' })
+  await advance(t, 400)
+  fx.callbacks.onSpeechEnd?.({ utteranceId: 'one', silenceMs: 400 })
+  await advance(t, 80)
+  await fx.callbacks.onTranscript?.('推荐一项活动。', { utteranceId: 'one' })
+  await advance(t, 120)
+  await advance(t, 100)
+  await advance(t, 700)
+  fx.text('native-1', '可以读书')
+  await advance(t, 200)
+  fx.text('native-1', '。')
+  await advance(t, 400)
+  fx.callbacks.onState('speaking')
+  assert.deepEqual(fx.controller.getSnapshot().latency, { totalMs: 2000, stages: [
+    { name: '尾静音', ms: 400 }, { name: 'ASR', ms: 80 }, { name: '轮次等待', ms: 120 },
+    { name: '决策', ms: 100 }, { name: '主模型首字', ms: 700 }, { name: '分句等待', ms: 200 }, { name: 'TTS 首音频', ms: 400 },
+  ] })
+})
+
+test('playback echo partials cannot trigger interjection and echo final resumes the answer', async t => {
+  const fx = setup(t, { action: 'interrupt' })
+  await fx.controller.toggle()
+  fx.start('manual'); fx.text('manual', '今天适合在家休息。')
+  fx.callbacks.onSpeechStart?.({ utteranceId: 'echo' })
+  fx.callbacks.onPartialTranscript?.('今天适合在家休息', { utteranceId: 'echo', likelyEcho: true })
+  await advance(t, 200)
+  assert.equal(fx.decisions.length, 0)
+  fx.callbacks.onSpeechEnd?.({ utteranceId: 'echo' })
+  await fx.callbacks.onTranscript?.('今天适合在家休息', { utteranceId: 'echo', likelyEcho: true })
+  assert.equal(fx.counts().audioCancels, 0)
+  assert.equal(fx.counts().resumes, 1)
+  assert.equal(fx.draft(), '')
 })

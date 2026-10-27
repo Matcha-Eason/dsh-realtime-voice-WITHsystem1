@@ -1,3 +1,4 @@
+import { LocalSenseVoice } from './local-asr.ts';
 import type { IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
 import WebSocket from 'ws';
@@ -15,9 +16,11 @@ export declare class QwenSpeechProxy {
     private readonly resolveKey;
     private readonly connectUpstream;
     private readonly requestAsr;
+    private readonly localAsr;
     private readonly server;
     private readonly sockets;
-    constructor(resolveKey: (service: QwenSpeechService) => Promise<string | undefined>, connectUpstream?: (endpoint: string, options: WebSocket.ClientOptions) => WebSocket, requestAsr?: typeof fetch);
+    constructor(resolveKey: (service: QwenSpeechService) => Promise<string | undefined>, connectUpstream?: (endpoint: string, options: WebSocket.ClientOptions) => WebSocket, requestAsr?: typeof fetch, localAsr?: Pick<LocalSenseVoice, 'prepare' | 'recognize'>);
     handle: (kind: QwenSpeechKind, req: IncomingMessage, socket: Duplex, head: Buffer) => Promise<void>;
+    private acceptAsr;
     close(): void;
 }

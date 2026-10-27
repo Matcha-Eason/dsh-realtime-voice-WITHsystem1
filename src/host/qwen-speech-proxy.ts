@@ -1,3 +1,5 @@
+import { WindowedAsr } from './windowed-asr.ts'
+import { LocalSenseVoice } from './local-asr.ts'
 import type { IncomingMessage } from 'node:http'
 import type { Duplex } from 'node:stream'
 import WebSocket, { WebSocketServer, type RawData } from 'ws'
@@ -58,13 +60,29 @@ export class QwenSpeechProxy {
     private readonly resolveKey: (service: QwenSpeechService) => Promise<string | undefined>,
     private readonly connectUpstream: (endpoint: string, options: WebSocket.ClientOptions) => WebSocket = (endpoint, options) => new WebSocket(endpoint, options),
     private readonly requestAsr: typeof fetch = fetch,
+    private readonly localAsr: Pick<LocalSenseVoice, 'prepare' | 'recognize'> = new LocalSenseVoice(),
   ) {}
 
   handle = async (kind: QwenSpeechKind, req: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> => {
     if (!isLoopbackRequest(req)) return rejectUpgrade(socket, 403, 'Forbidden')
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+    const engine = url.searchParams.get('engine')
+    // Local recognition owns no cloud credential and cannot change TTS billing.
+    if (engine === 'local-sensevoice' && kind === 'asr') {
+      try { await this.localAsr.prepare() }
+      catch {
+        this.server.handleUpgrade(req, socket, head, local => {
+          sendSafeError(local, '本地 ASR 未就绪，请先运行 npm run setup:asr')
+          local.close(1011, 'local ASR unavailable')
+        })
+        return
+      }
+      this.acceptAsr(req, socket, head, emit => new WindowedAsr(this.localAsr.recognize, emit, 500))
+      return
+    }
+    if (engine !== null && engine !== 'cloud') return rejectUpgrade(socket, 400, 'Bad Request')
     let route: ReturnType<typeof resolveQwenSpeechRoute>
     try {
-      const url = new URL(req.url ?? '/', 'http://127.0.0.1')
       route = resolveQwenSpeechRoute(kind, url.searchParams)
     } catch {
       return rejectUpgrade(socket, 400, 'Bad Request')
@@ -72,22 +90,12 @@ export class QwenSpeechProxy {
     const key = await this.resolveKey(route.service)
     if (key === undefined || key.trim() === '') return rejectUpgrade(socket, 502, 'Speech credential unavailable')
 
+    if (route.protocol === 'http') {
+      this.acceptAsr(req, socket, head, emit => new QwenHttpAsr(route.model, key, emit, this.requestAsr))
+      return
+    }
     this.server.handleUpgrade(req, socket, head, local => {
       this.sockets.add(local)
-      if (route.protocol === 'http') {
-        const asr = new QwenHttpAsr(route.model, key,
-          event => { if (local.readyState === WebSocket.OPEN) local.send(JSON.stringify(event)) }, this.requestAsr)
-        local.on('message', (data, binary) => {
-          try {
-            const event = JSON.parse(data.toString()) as unknown
-            if (binary || !event || typeof event !== 'object' || Array.isArray(event)) throw new Error('invalid event')
-            asr.client(event as Record<string, unknown>)
-          } catch { sendSafeError(local, 'Invalid Qwen ASR client event'); asr.close() }
-        })
-        local.on('close', () => { this.sockets.delete(local); asr.close() })
-        local.on('error', () => asr.close())
-        return
-      }
       const upstream = this.connectUpstream(route.endpoint, {
         headers: {
           Authorization: `Bearer ${key}`,
@@ -139,6 +147,22 @@ export class QwenSpeechProxy {
         this.sockets.delete(upstream)
         if (local.readyState === WebSocket.OPEN) local.close(1000, 'upstream closed')
       })
+    })
+  }
+
+  private acceptAsr(req: IncomingMessage, socket: Duplex, head: Buffer, create: (emit: (event: Record<string, unknown>) => void) => WindowedAsr): void {
+    this.server.handleUpgrade(req, socket, head, local => {
+      this.sockets.add(local)
+      const asr = create(event => { if (local.readyState === WebSocket.OPEN) local.send(JSON.stringify(event)) })
+      local.on('message', (data, binary) => {
+        try {
+          const event = JSON.parse(data.toString()) as unknown
+          if (binary || !event || typeof event !== 'object' || Array.isArray(event)) throw new Error('invalid event')
+          asr.client(event as Record<string, unknown>)
+        } catch { sendSafeError(local, 'Invalid ASR client event'); asr.close() }
+      })
+      local.on('close', () => { this.sockets.delete(local); asr.close() })
+      local.on('error', () => asr.close())
     })
   }
 

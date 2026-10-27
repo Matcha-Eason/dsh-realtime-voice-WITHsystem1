@@ -36,6 +36,10 @@ export function VoiceStatus({ controller, input, inputActions }: { controller: V
   const labels = { connecting: '正在连接', listening: '正在聆听', speaking: '正在说话', working: '主模型正在处理', error: '语音不可用' }
   return <div role={snapshot.state === 'error' ? 'alert' : 'status'} style={styles.dock}>
     <div>{labels[snapshot.state]}{snapshot.playback === 'paused' ? ' · 播放已暂停' : ''}{snapshot.detail ? `：${snapshot.detail}` : ''}</div>
+    {snapshot.latency && <details style={{ marginTop: 4 }}><summary>上轮说完至首音频 {(snapshot.latency.totalMs / 1000).toFixed(2)} 秒</summary>
+      <div>{snapshot.latency.stages.map(stage => `${stage.name} ${stage.ms} ms`).join(' · ')}</div>
+      <div>以 ASR 断句和音频到达时间估算，不含设备实际出声延迟。{snapshot.audioInfo?.echoCancellation === true ? '浏览器回声消除已启用。' : snapshot.audioInfo?.echoCancellation === false ? '浏览器未启用回声消除，建议使用耳机。' : ''}</div>
+    </details>}
     {snapshot.transcript && <div style={{ marginTop: 4, whiteSpace: 'pre-wrap', opacity: .8 }}>{snapshot.transcript}</div>}
   </div>
 }
@@ -49,6 +53,10 @@ export function SettingsCard() {
     <Field label="语音服务"><select style={styles.input} value={prefs.speechService} onChange={e => updatePrefs({ speechService: e.currentTarget.value === 'dashscope' ? 'dashscope' : 'token-plan' })}>
       <option value="token-plan">百炼 Token Plan</option><option value="dashscope">百炼按量服务</option>
     </select></Field>
+    <Field label="语音识别"><select style={styles.input} value={prefs.asrEngine} onChange={e => updatePrefs({ asrEngine: e.currentTarget.value === 'local-sensevoice' ? 'local-sensevoice' : 'cloud' })}>
+      <option value="cloud">云端 ASR</option><option value="local-sensevoice">本地 SenseVoice</option>
+    </select></Field>
+    {prefs.asrEngine === 'local-sensevoice' && <p style={{ opacity: .7 }}>需在运行 DSH 的电脑上准备模型。切换后重新开启麦克风。</p>}
     <Field label="语音自动发送"><input type="checkbox" checked={prefs.voiceDraftAutoSend} onChange={e => updatePrefs({ voiceDraftAutoSend: e.currentTarget.checked })} /></Field>
     <Field label="语义轮次判断"><input type="checkbox" checked={prefs.decisionEnabled} onChange={e => updatePrefs({ decisionEnabled: e.currentTarget.checked })} /></Field>
     <Field label="允许主动澄清"><input type="checkbox" checked={prefs.proactiveEnabled} disabled={!prefs.decisionEnabled} onChange={e => updatePrefs({ proactiveEnabled: e.currentTarget.checked })} /></Field>
@@ -59,13 +67,13 @@ export function SettingsCard() {
         <Field label="Workspace ID"><input style={styles.input} value={prefs.qwenWorkspaceId} onChange={e => updatePrefs({ qwenWorkspaceId: e.currentTarget.value })} /></Field>
         <Field label="区域"><select style={styles.input} value={prefs.qwenRegion} onChange={e => updatePrefs({ qwenRegion: e.currentTarget.value === 'ap-southeast-1' ? 'ap-southeast-1' : 'cn-beijing' })}><option value="cn-beijing">北京</option><option value="ap-southeast-1">新加坡</option></select></Field>
       </>}
-      <Field label="ASR 模型"><input style={styles.input} value={prefs.qwenAsrModel} onChange={e => updatePrefs({ qwenAsrModel: e.currentTarget.value })} /></Field>
+      {prefs.asrEngine === 'cloud' && <Field label="ASR 模型"><input style={styles.input} value={prefs.qwenAsrModel} onChange={e => updatePrefs({ qwenAsrModel: e.currentTarget.value })} /></Field>}
       <Field label="TTS 模型"><input style={styles.input} value={prefs.qwenTtsModel} onChange={e => updatePrefs({ qwenTtsModel: e.currentTarget.value })} /></Field>
       <Field label="决策模型"><input style={styles.input} value={prefs.decisionModel} onChange={e => updatePrefs({ decisionModel: e.currentTarget.value })} /></Field>
       <Field label="决策超时（毫秒）"><input style={styles.input} type="number" min={250} max={10000} step={250} value={prefs.decisionTimeoutMs} onChange={e => updatePrefs({ decisionTimeoutMs: e.currentTarget.valueAsNumber })} /></Field>
       <Field label="续说等待（毫秒）"><input style={styles.input} type="number" min={100} max={5000} step={100} value={prefs.qwenMergeMs} onChange={e => updatePrefs({ qwenMergeMs: e.currentTarget.valueAsNumber })} /></Field>
       <Field label="尾静音（毫秒）"><input style={styles.input} type="number" min={200} max={6000} step={100} value={prefs.qwenSilenceMs} onChange={e => updatePrefs({ qwenSilenceMs: e.currentTarget.valueAsNumber })} /></Field>
-      {prefs.speechService === 'dashscope' && <Field label="人声阈值"><input style={styles.input} type="number" min={-1} max={1} step={.05} value={prefs.qwenVadThreshold} onChange={e => updatePrefs({ qwenVadThreshold: e.currentTarget.valueAsNumber })} /></Field>}
+      {prefs.asrEngine === 'cloud' && prefs.speechService === 'dashscope' && <Field label="人声阈值"><input style={styles.input} type="number" min={-1} max={1} step={.05} value={prefs.qwenVadThreshold} onChange={e => updatePrefs({ qwenVadThreshold: e.currentTarget.valueAsNumber })} /></Field>}
       <Field label="敏感指令手动发送"><input type="checkbox" checked={prefs.voiceDraftSensitiveDeny} onChange={e => updatePrefs({ voiceDraftSensitiveDeny: e.currentTarget.checked })} /></Field>
       <p style={{ opacity: .7 }}>Token Plan 凭据由 Harness Host 的 BAILIAN_TOKEN_PLAN_API_KEY 提供；主模型在会话的模型选择器中配置。</p>
     </>}

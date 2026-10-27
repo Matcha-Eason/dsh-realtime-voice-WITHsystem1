@@ -1,3 +1,4 @@
+import { PCM_CAPTURE_WORKLET } from './capture-worklet.ts'
 import type { VoicePrefs } from './prefs.ts'
 import type { RealtimeCallbacks, TranscriptMeta } from './realtime.ts'
 import type { TurnPhase } from './turn-coordinator.ts'
@@ -9,7 +10,7 @@ export class QwenPipelineConnection {
   private microphone?: MediaStream
   private captureContext?: AudioContext
   private captureSource?: MediaStreamAudioSourceNode
-  private processor?: ScriptProcessorNode
+  private processor?: AudioWorkletNode
   private silentGain?: GainNode
   private readonly player = new PcmPlayer()
   private ttsReady?: Promise<void>
@@ -61,7 +62,7 @@ export class QwenPipelineConnection {
     if (this.disposed) return
     await this.openAsr()
     if (this.disposed) return
-    this.startCapture()
+    await this.startCapture()
   }
 
   async speak(text: string): Promise<void> {
@@ -130,7 +131,7 @@ export class QwenPipelineConnection {
     this.disposed = true
     this.cancelSpeech()
     this.player.dispose()
-    this.processor?.disconnect()
+    if (this.processor) { this.processor.port.onmessage = null; this.processor.port.close(); this.processor.disconnect() }
     this.captureSource?.disconnect()
     this.silentGain?.disconnect()
     void this.captureContext?.close()
@@ -210,29 +211,33 @@ export class QwenPipelineConnection {
     await Promise.all([opened(socket), this.ttsReady])
   }
 
-  private startCapture(): void {
-    if (this.microphone === undefined) return
+  private async startCapture(): Promise<void> {
+    if (this.microphone === undefined || this.disposed) return
     const context = new AudioContext()
+    this.captureContext = context
+    const moduleUrl = URL.createObjectURL(new Blob([PCM_CAPTURE_WORKLET], { type: 'text/javascript' }))
+    try { await context.audioWorklet.addModule(moduleUrl) }
+    finally { URL.revokeObjectURL(moduleUrl) }
+    if (this.disposed) return
     const source = context.createMediaStreamSource(this.microphone)
-    const processor = context.createScriptProcessor(2048, 1, 1)
+    const processor = new AudioWorkletNode(context, 'dsh-pcm-capture', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] })
     const silent = context.createGain()
     silent.gain.value = 0
-    processor.onaudioprocess = event => {
-      if (this.asr?.readyState !== WebSocket.OPEN) return
-      const pcm = downsampleToPcm16(event.inputBuffer.getChannelData(0), context.sampleRate, 16000)
-      if (pcm.byteLength === 0 || this.asr.bufferedAmount > 512 * 1024) return
-      // Capture remains continuous during playback and soft pauses. Browser
-      // AEC handles the playback reference; semantic echo checks are metadata,
-      // never a reason to discard microphone frames.
-      this.appendAsr(pcm)
+    processor.port.onmessage = event => {
+      if (this.disposed || this.asr?.readyState !== WebSocket.OPEN || this.asr.bufferedAmount > 512 * 1024) return
+      // Capture has its own running AudioContext: suspending playback must
+      // never suspend listening. Browser AEC supplies the playback reference.
+      this.appendAsr(new Int16Array(event.data as ArrayBuffer))
     }
     source.connect(processor)
     processor.connect(silent)
     silent.connect(context.destination)
-    this.captureContext = context
     this.captureSource = source
     this.processor = processor
     this.silentGain = silent
+    await context.resume()
+    const settings = this.microphone.getAudioTracks?.()[0]?.getSettings?.()
+    this.callbacks.onAudioInfo?.({ capture: 'audio-worklet', echoCancellation: settings?.echoCancellation })
   }
 
   private async handleAsr(raw: unknown): Promise<void> {
@@ -252,7 +257,8 @@ export class QwenPipelineConnection {
     }
     if (type === 'input_audio_buffer.speech_stopped') {
       const itemId = typeof event.item_id === 'string' ? event.item_id : this.activeUtteranceId
-      this.callbacks.onSpeechEnd?.({ utteranceId: itemId })
+      const silenceMs = typeof event.silence_ms === 'number' ? Math.max(0, Math.min(6000, event.silence_ms)) : this.prefs.qwenSilenceMs
+      this.callbacks.onSpeechEnd?.({ utteranceId: itemId, silenceMs })
       if (this.prefs.voiceprintEnabled && itemId !== undefined) this.voiceprintCapture.stop(itemId)
     }
     if (type === 'conversation.item.input_audio_transcription.text'
@@ -546,6 +552,7 @@ function proxyUrl(kind: 'asr' | 'tts', prefs: VoicePrefs): string {
   const service = prefs.speechService ?? 'token-plan'
   const query = new URLSearchParams({
     service,
+    ...(kind === 'asr' ? { engine: prefs.asrEngine ?? 'cloud' } : {}),
     workspaceId: service === 'token-plan' ? 'token-plan' : prefs.qwenWorkspaceId,
     region: service === 'token-plan' ? 'cn-beijing' : prefs.qwenRegion,
     model: kind === 'asr' ? prefs.qwenAsrModel : prefs.qwenTtsModel,
@@ -653,21 +660,6 @@ function ttsWeight(text: string): number {
 
 function isCjk(char: string): boolean { return /[\u3400-\u9fff\uf900-\ufaff]/u.test(char) }
 function needsSpace(left: string, right: string): boolean { return /[A-Za-z0-9]$/.test(left) && /^[A-Za-z0-9]/.test(right) }
-
-function downsampleToPcm16(input: Float32Array, inputRate: number, outputRate: number): Int16Array {
-  const ratio = inputRate / outputRate
-  const length = Math.floor(input.length / ratio)
-  const output = new Int16Array(length)
-  for (let index = 0; index < length; index++) {
-    const start = Math.floor(index * ratio)
-    const end = Math.max(start + 1, Math.floor((index + 1) * ratio))
-    let sum = 0
-    for (let at = start; at < end && at < input.length; at++) sum += input[at] ?? 0
-    const sample = Math.max(-1, Math.min(1, sum / (end - start)))
-    output[index] = sample < 0 ? sample * 32768 : sample * 32767
-  }
-  return output
-}
 
 function base64(buffer: ArrayBufferLike): string {
   const bytes = new Uint8Array(buffer as ArrayBuffer)

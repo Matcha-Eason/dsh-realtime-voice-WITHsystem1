@@ -56,7 +56,7 @@ export async function decideTurn(
 ): Promise<TurnDecision> {
   const state = parseTurnDecisionState(input)
   const model = options.model ?? DEFAULT_TURN_DECISION_MODEL
-  const timeoutMs = options.timeoutMs ?? 2_000
+  const timeoutMs = options.timeoutMs ?? 4_000
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(model)
     || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 10_000) {
     throw new Error('invalid turn decision configuration')
@@ -66,22 +66,36 @@ export async function decideTurn(
   if (!state.transcript.trim()) return { action: 'wait', revision: state.revision }
 
   const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
-  const response = await (options.fetch ?? fetch)(TURN_DECISION_ENDPOINT, {
-    method: 'POST',
-    signal: requestSignal,
-    headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
-    body: JSON.stringify({
-      model,
-      state,
-      questions: { action: { type: 'choice', instructions: INSTRUCTIONS, criteria: ACTION_CRITERIA } },
-    }),
+  const payload = JSON.stringify({
+    model,
+    state,
+    questions: { action: { type: 'choice', instructions: INSTRUCTIONS, criteria: ACTION_CRITERIA } },
   })
-  if (!response.ok) throw new Error(`turn decision provider rejected request (${response.status})`)
   let body: { answers?: { action?: { type?: unknown; choice?: unknown } } } | null
-  try { body = await response.json() as typeof body }
-  catch {
-    requestSignal.throwIfAborted()
-    throw new Error('turn decision provider returned invalid JSON')
+  for (let attempt = 0; ; attempt++) {
+    // Measurements found occasional stalled final decisions. Retry this pure
+    // classification once, within the user's total deadline. Never retry an
+    // obsolete snapshot, a partial, a rejected request or an invalid response.
+    const canRetry = attempt === 0 && state.isFinal && timeoutMs >= 3000
+    const attemptSignal = canRetry ? AbortSignal.any([requestSignal, AbortSignal.timeout(2000)]) : requestSignal
+    try {
+      const response = await (options.fetch ?? fetch)(TURN_DECISION_ENDPOINT, {
+        method: 'POST', signal: attemptSignal,
+        headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+        body: payload,
+      })
+      if (!response.ok) throw new Error(`turn decision provider rejected request (${response.status})`)
+      try { body = await response.json() as typeof body }
+      catch {
+        attemptSignal.throwIfAborted()
+        throw new Error('turn decision provider returned invalid JSON')
+      }
+      attemptSignal.throwIfAborted()
+      break
+    } catch (error) {
+      requestSignal.throwIfAborted()
+      if (!canRetry || !attemptSignal.aborted) throw error
+    }
   }
   requestSignal.throwIfAborted()
   const answer = body?.answers?.action

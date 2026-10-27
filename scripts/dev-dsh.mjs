@@ -49,7 +49,11 @@ await writeFile(patch, JSON.stringify([
     apiKeyEnv: 'BAILIAN_TOKEN_PLAN_API_KEY',
     api: 'openai-completions',
     baseURL: 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1',
-    models: [{ id: mainModel, reasoningEfforts: false }],
+    reasoning: 'off',
+    // Bailian uses enable_thinking even for DeepSeek. Declaring no reasoning
+    // support would omit the field and leave the provider's thinking enabled.
+    compat: { thinkingFormat: 'qwen' },
+    models: [...new Set([mainModel, 'deepseek-v4.1-flash', 'qwen3.8-flash'])].map(id => ({ id, reasoningEfforts: { off: null, high: 'high' } })),
   } } } },
 ], null, 2) + '\n')
 

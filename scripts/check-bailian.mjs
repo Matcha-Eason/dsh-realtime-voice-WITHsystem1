@@ -9,10 +9,11 @@ import { decideTurn } from '../lib/host/turn-decision.js'
 const key = process.env.BAILIAN_TOKEN_PLAN_API_KEY
 if (!key) throw new Error('Set BAILIAN_TOKEN_PLAN_API_KEY in .env.local')
 const mainModel = process.env.DSH_VOICE_MAIN_MODEL ?? 'deepseek-v4.1-flash'
+const localAsr = process.env.CHECK_ASR === 'local'
 const requestStarted = Date.now()
 const response = await fetch('https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions', {
   method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-  body: JSON.stringify({ model: mainModel, messages: [{ role: 'user', content: '请只回复这一句话，不解释：你好，语音测试已经准备好了。' }], max_tokens: 512 }),
+  body: JSON.stringify({ model: mainModel, enable_thinking: false, messages: [{ role: 'user', content: '请只回复这一句话，不解释：你好，语音测试已经准备好了。' }], max_tokens: 512 }),
   signal: AbortSignal.timeout(30_000),
 })
 if (!response.ok) throw new Error(`Main model HTTP ${response.status}`)
@@ -68,7 +69,7 @@ try {
   const pcm16 = Buffer.alloc(Math.floor(pcm24.length / 3) * 2)
   for (let i = 0; i < pcm16.length / 2; i++) pcm16.writeInt16LE(pcm24.readInt16LE(Math.floor(i * 1.5) * 2), i * 2)
   const transcript = await new Promise((resolve, reject) => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/asr/qwen?service=token-plan`, { headers: { Origin: origin } })
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/asr/qwen?service=token-plan${localAsr ? '&engine=local-sensevoice' : ''}`, { headers: { Origin: origin } })
     sockets.add(ws)
     const timer = setTimeout(() => { ws.close(); reject(new Error('ASR timeout')) }, 25_000)
     let previews = 0
@@ -86,7 +87,7 @@ try {
       } else if (event.type === 'conversation.item.input_audio_transcription.text') previews++
       else if (event.type === 'conversation.item.input_audio_transcription.completed') {
         clearTimeout(timer); ws.close()
-        console.log(JSON.stringify({ check: 'asr-via-plugin', previews, transcript: event.transcript }))
+        console.log(JSON.stringify({ check: 'asr-via-plugin', engine: localAsr ? 'local-sensevoice' : 'cloud', previews, transcript: event.transcript }))
         resolve(event.transcript)
       } else if (event.type === 'error') {
         clearTimeout(timer); ws.close(); reject(new Error(event.error.message))

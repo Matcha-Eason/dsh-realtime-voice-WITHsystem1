@@ -7,10 +7,13 @@
 | `src/client/controller.ts` | 输入草稿所有权、转写修订、轮次动作、主模型输出、插话候选生命周期 |
 | `src/client/harness-delegate.ts` | 原生 Session retain / binding、提交、事件观察、定向取消 |
 | `src/client/qwen-pipeline.ts` | 麦克风与 ASR 连接、PCM 播放、暂停/恢复/取消、音频代际 |
+| `src/client/capture-worklet.ts` | 音频线程内跨块重采样、16 kHz / 20 ms PCM 帧 |
 | `src/client/voice-summary.ts` | 可见正文的流式分句与 Markdown / 代码过滤 |
 | `src/turn-decision.ts` | 决策输入、动作、修订号的数据约定 |
-| `src/host/turn-decision.ts` | SystemOne 请求、超时和结果校验 |
-| `src/host/qwen-inference.ts` | Token Plan TTS inference 协议与 HTTP ASR 窗口调度 |
+| `src/host/turn-decision.ts` | SystemOne 请求、总超时、最终判断的一次超时重试和结果校验 |
+| `src/host/windowed-asr.ts` | 本地 VAD、滚动预览、最终识别优先级和取消；云端与本地共用 |
+| `src/host/qwen-inference.ts` | Token Plan TTS inference 协议与 HTTP ASR 请求转换 |
+| `src/host/local-asr.ts` | Host 共享 SenseVoice 模型、异步加载与识别 |
 | `src/host/qwen-speech-proxy.ts` | 语音连接、服务选择和 Host 凭据边界 |
 | `src/index.ts` | 同源路由、设置、当前会话的临时口语输出指令 |
 
@@ -18,7 +21,9 @@
 
 ## 数据路径
 
-麦克风 PCM → 本地 Host ASR 代理 → 转写修订 → 轮次判断 → 原生输入框 / DSH Session → 主模型可见回答 → 分句 → Host TTS 代理 → PCM 播放。
+麦克风 → AudioWorklet PCM → Host ASR（本地 SenseVoice / 云端）→ 转写修订 → 轮次判断 → 原生输入框 / DSH Session → 主模型可见回答 → 分句 → Host TTS 代理 → PCM 播放。
+
+采集和播放各有独立 AudioContext，暂停播报不会冻结收音。浏览器请求 AEC，并记录设备实际返回的启用状态；文本回声匹配只作为补充，不能保证外放条件下无误判。SenseVoice 的原生异步解码不能中途停止，取消时丢弃结果，等本次计算结束后处理下一窗口。
 
 决策只返回 `wait`、`submit`、`backchannel`、`interrupt`、`interject` 或 `cancel` 与对应修订号。它看到转写、用户/助手发言状态、主模型忙闲和近期助手正文，不生成播报内容。
 
@@ -36,6 +41,9 @@
 - 旧决策、重试旧 TTS 的取消异常、旧 socket 音频均不能影响新输出。
 - 用户继续说话会撤销尚未播放的澄清；起声、final 和 HTTP ASR 时序不能误提交旧句。
 - 关闭时仍未完成的麦克风授权会释放迟到的音轨，不再连接后续服务。
+- 44.1/48 kHz 音频跨任意块重采样不丢采样，相同 1 秒输入产生 50 个 20 ms 帧。
+- 本地 ASR 不解析云端凭据；最终识别取消过时预览；断句和识别只计入一次续说窗口。
+- 决策超时最多重试一次，总时限和用户取消均有效；诊断时间覆盖最后人声至首音频。
 
 人工验收还需覆盖：耳机连续对话、外放回声、长句与口音、噪声中的误打断、网络变慢、工具执行期间补充信息。记录从尾静音到最终转写、决策、主模型首文字、TTS 首音频及实际播放的时间，分别优化，避免仅用首 token 代替体感延迟。
 
@@ -43,4 +51,4 @@
 
 使用原生 API，只有拥有生命周期、协议转换或错误处理的边界才保留适配层。决策不能越过草稿修订检查。TTS 不能自行补写、总结或生成答案。主动澄清目前通过主模型提示要求不调用工具，尚无独立的硬性工具隔离。
 
-生成的 `lib/` 沿用上游仓库的提交方式；源文件修改后运行 `npm run check` 重建。开发启动脚本与真实服务自测仅属于源码 checkout，不随插件包发布。
+生成的 `lib/` 沿用上游仓库的提交方式；源文件修改后运行 `npm run check` 重建。开发启动脚本、基准和真实服务自测仅属于源码 checkout；模型准备脚本随包发布，模型权重不发布。测量方法和结果见 [延迟报告](LATENCY.md)。

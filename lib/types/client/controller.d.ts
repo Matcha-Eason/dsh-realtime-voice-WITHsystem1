@@ -12,6 +12,17 @@ export interface VoiceSnapshot {
     mainBusy: boolean;
     playback: 'idle' | 'playing' | 'paused';
     transcript: string;
+    latency?: {
+        totalMs: number;
+        stages: Array<{
+            name: string;
+            ms: number;
+        }>;
+    };
+    audioInfo?: {
+        capture: 'audio-worklet';
+        echoCancellation?: boolean;
+    };
 }
 export interface VoiceConnection {
     connect(): Promise<void>;
@@ -58,6 +69,7 @@ export declare class VoiceController {
     private readonly pendingFinals;
     private revision;
     private speechActive;
+    private speechEndedAt?;
     private output?;
     private heardText;
     private interrupted;
@@ -69,6 +81,9 @@ export declare class VoiceController {
     private decisionDirty;
     private interjection?;
     private lastInterjectionAt;
+    private trace;
+    private latency?;
+    private audioInfo?;
     private voiceprint;
     constructor(sessionId: string, bridge: HarnessBridge, createConnection?: VoiceConnectionFactory, decide?: DecideTurn);
     subscribe: (listener: () => void) => (() => void);

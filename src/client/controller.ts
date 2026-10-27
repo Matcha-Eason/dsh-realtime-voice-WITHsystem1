@@ -15,6 +15,8 @@ export interface VoiceSnapshot {
   mainBusy: boolean
   playback: 'idle' | 'playing' | 'paused'
   transcript: string
+  latency?: { totalMs: number; stages: Array<{ name: string; ms: number }> }
+  audioInfo?: { capture: 'audio-worklet'; echoCancellation?: boolean }
 }
 export interface VoiceConnection {
   connect(): Promise<void>
@@ -75,6 +77,7 @@ export class VoiceController {
   private readonly pendingFinals = new Set<string | undefined>()
   private revision = 0
   private speechActive = false
+  private speechEndedAt?: number
   private output?: SpeechOutput
   private heardText = ''
   private interrupted = false
@@ -86,6 +89,9 @@ export class VoiceController {
   private decisionDirty = false
   private interjection?: Interjection
   private lastInterjectionAt = -Infinity
+  private trace: { userEnd?: number; endpoint?: number; final?: number; decisionStart?: number; decisionEnd?: number; submit?: number; firstText?: number; tts?: number; turn?: string; firstAudio?: number } = {}
+  private latency?: VoiceSnapshot['latency']
+  private audioInfo?: VoiceSnapshot['audioInfo']
   private voiceprint: TranscriptMeta['voiceprint']
 
   constructor(
@@ -141,6 +147,17 @@ export class VoiceController {
         if (state === 'error') { this.publish('error', detail ?? '语音连接失败'); return }
         if (state === 'speaking') {
           if (!this.output || this.output.muted || this.output.source !== source) return
+          const trace = this.trace
+          if (trace.turn === this.output.turn && trace.userEnd !== undefined && trace.submit !== undefined && trace.firstAudio === undefined) {
+            trace.firstAudio = Date.now()
+            const points = [
+              ['尾静音', trace.userEnd, trace.endpoint], ['ASR', trace.endpoint, trace.final],
+              ['轮次等待', trace.final, trace.decisionStart ?? trace.submit], ['决策', trace.decisionStart, trace.decisionEnd],
+              ['主模型首字', trace.submit, trace.firstText], ['分句等待', trace.firstText, trace.tts], ['TTS 首音频', trace.tts, trace.firstAudio],
+            ] as const
+            this.latency = { totalMs: trace.firstAudio - trace.userEnd, stages: points.flatMap(([name, from, to]) =>
+              from === undefined || to === undefined ? [] : [{ name, ms: Math.max(0, to - from) }]) }
+          }
           const candidate = this.interjection
           if (candidate && !candidate.delivered) {
             if (candidate.abort.signal.aborted || this.transcript() !== candidate.text) { this.cancelUnheardInterjection(); return }
@@ -155,10 +172,13 @@ export class VoiceController {
         }
         this.publish(state === 'connecting' ? 'connecting' : undefined, detail)
       },
+      onAudioInfo: info => { if (this.connection === source && this.epoch === epoch) { this.audioInfo = info; this.publish() } },
       onSpeechStart: meta => {
         if (this.connection !== source || this.epoch !== epoch) return
+        this.trace = {}
         this.pendingFinals.add(meta?.utteranceId)
         this.speechActive = true
+        this.speechEndedAt = undefined
         const candidate = this.interjection
         const continuingInterjection = candidate !== undefined && !candidate.delivered
           && meta?.utteranceId !== undefined && meta.utteranceId === candidate.utteranceId
@@ -172,11 +192,14 @@ export class VoiceController {
         this.invalidateDecision()
         this.publish(undefined, '正在听你说')
       },
-      onSpeechEnd: () => {
+      onSpeechEnd: meta => {
         if (this.connection !== source || this.epoch !== epoch) return
         this.speechActive = false
+        this.speechEndedAt = Date.now() - (meta?.silenceMs ?? 0)
+        this.trace.userEnd = this.speechEndedAt
+        this.trace.endpoint = Date.now()
         this.invalidateDecision()
-        this.scheduleDecision(loadPrefs().qwenMergeMs)
+        this.scheduleDecision(Math.max(0, loadPrefs().qwenMergeMs - (meta?.silenceMs ?? 0)))
         this.publish()
       },
       onPartialTranscript: (text, meta) => {
@@ -196,7 +219,10 @@ export class VoiceController {
         onTurnStart: turn => { if (this.epoch === epoch) this.beginOutput(source, turn) },
         onTextDelta: (turn, delta) => {
           if (this.connection !== source || this.epoch !== epoch) return
-          if (this.output?.turn === turn && !this.output.muted) this.output.stream.push(delta)
+          if (this.output?.turn === turn && !this.output.muted) {
+            if (this.trace.turn === turn) this.trace.firstText ??= Date.now()
+            this.output.stream.push(delta)
+          }
         },
         onTextReset: (turn, reason) => {
           if (this.connection !== source || this.epoch !== epoch) return
@@ -249,6 +275,7 @@ export class VoiceController {
     source?.disconnect()
     if (source) void this.bridge.setVoiceMode(this.sessionId, false).catch(() => {})
     this.speechActive = false
+    this.speechEndedAt = undefined
     this.playback = 'idle'
     this.nativePending = false
     this.finals = []
@@ -265,6 +292,7 @@ export class VoiceController {
 
   private receivePartial(source: VoiceConnection, text: string, meta: TranscriptMeta = {}): void {
     if (this.connection !== source || (meta.utteranceId && this.finalIds.has(meta.utteranceId))) return
+    if (meta.likelyEcho) return
     text = this.unconsumed(text.trim(), meta.utteranceId)
     if (this.partial === text && this.partialId === meta.utteranceId) return
     this.stablePartial = this.partialId === meta.utteranceId ? commonPrefix(this.partial, text) : ''
@@ -278,6 +306,7 @@ export class VoiceController {
 
   private receiveFinal(source: VoiceConnection, text: string, meta: TranscriptMeta = {}): void {
     if (this.connection !== source) return
+    this.trace.final = Date.now()
     this.pendingFinals.delete(meta.utteranceId)
     if (meta.utteranceId) {
       if (this.finalIds.has(meta.utteranceId)) return
@@ -302,7 +331,10 @@ export class VoiceController {
     this.invalidateDecision()
     if (this.interjection && !this.interjection.delivered && this.transcript() !== this.interjection.text) this.cancelUnheardInterjection()
     if (isExplicitCancel(text)) { void this.cancelTask(); return }
-    this.scheduleDecision(loadPrefs().qwenMergeMs)
+    // Recognition time already belongs to the continuation window. Do not
+    // add another full merge delay after a slow final result.
+    const quietFor = this.speechEndedAt === undefined ? 0 : Date.now() - this.speechEndedAt
+    this.scheduleDecision(Math.max(0, loadPrefs().qwenMergeMs - quietFor))
     this.publish(undefined, '正在判断是否说完；继续说会合并')
   }
 
@@ -327,6 +359,7 @@ export class VoiceController {
 
   private invalidateDecision(): void {
     this.revision++
+    this.decisionAbort?.abort()
     if (this.decisionTimer) clearTimeout(this.decisionTimer)
     this.decisionTimer = undefined
     this.decisionDirty = false
@@ -360,7 +393,14 @@ export class VoiceController {
       mainBusy: this.isMainBusy(),
       recentAssistantText: this.heardText,
     }
+    // A final is imminent: skip a doomed partial decision, while still
+    // allowing partials to yield playback during an actual interruption.
+    if (!state.userSpeaking && this.pendingFinals.size > 0 && !state.assistantSpeaking && !state.mainBusy) return
     const prefs = loadPrefs()
+    // With no answer to interrupt, partials can only request a clarification.
+    // Wait for stable words before paying for a decision that cannot act yet.
+    if (!state.isFinal && !state.assistantSpeaking && !state.mainBusy
+      && (!prefs.proactiveEnabled || !state.stableText.trim())) return
     if (!prefs.decisionEnabled) {
       if (state.isFinal && !state.userSpeaking && !state.mainBusy && !state.assistantSpeaking) await this.submitDraft(source, state.revision)
       return
@@ -368,8 +408,10 @@ export class VoiceController {
     const controller = new AbortController()
     this.decisionAbort = controller
     try {
+      if (state.isFinal) this.trace.decisionStart = Date.now()
       const decision = await this.decide(state, controller.signal)
       if (this.connection !== source || controller.signal.aborted || decision.revision !== this.revision) return
+      if (state.isFinal) this.trace.decisionEnd = Date.now()
       switch (decision.action) {
         case 'cancel': await this.cancelTask(); break
         case 'backchannel':
@@ -420,6 +462,7 @@ export class VoiceController {
       await this.bridge.setVoiceMode(this.sessionId, true, undefined, { heardText: this.heardText, interrupted: this.interrupted })
       if (this.connection !== source || revision !== this.revision || !this.draftIsOwned() || this.speechActive || this.pendingFinals.size > 0) return
       // The native submit owns command handling, attachments and queue admission.
+      this.trace.submit = Date.now()
       this.draft!.submit!()
       this.finals = []
       this.partial = ''
@@ -484,6 +527,7 @@ export class VoiceController {
     const output: SpeechOutput = { turn, source, stream: undefined!, pending: [], draining: false, speechRevision: 0, muted: false, done: false }
     output.stream = this.createSpeechStream(output)
     this.output = output
+    if (this.trace.submit !== undefined) this.trace.turn = turn
     this.heardText = ''
     this.interrupted = false
     this.playback = 'idle'
@@ -518,6 +562,7 @@ export class VoiceController {
         && (!this.speechActive || this.interjection === candidate && interjecting) && output.pending.length) {
         const sentence = output.pending.shift()!
         output.source.setInputPhase?.('tts-pending')
+        if (this.trace.turn === output.turn) this.trace.tts ??= Date.now()
         await output.source.speak?.(sentence)
       }
       if (this.output !== output || output.speechRevision !== speechRevision || output.muted) return
@@ -626,6 +671,7 @@ export class VoiceController {
     const busy = this.isMainBusy()
     this.snapshot = {
       state: state ?? (this.playback === 'playing' ? 'speaking' : busy ? 'working' : this.connection ? 'listening' : 'idle'),
+      latency: this.latency, audioInfo: this.audioInfo,
       detail, provider: 'qwen', userSpeaking: this.speechActive, mainBusy: busy, playback: this.playback, transcript: this.transcript(),
     }
     this.listeners.forEach(listener => listener())

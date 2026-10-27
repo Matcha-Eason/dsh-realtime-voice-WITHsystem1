@@ -413,7 +413,7 @@ test('prefs force the main-model-only speech path, bound decisions, and omit obs
   assert.equal(stored.decisionModel, 'decision-model-preview')
   assert.equal(stored.decisionEnabled, true)
   assert.equal(stored.proactiveEnabled, true)
-  assert.equal(stored.qwenMergeMs, 400)
+  assert.equal(stored.qwenMergeMs, 600)
   assert.equal(stored.voiceDraftDwellMs, 700)
   assert.equal(stored.voiceDraftAllowWithoutVoiceprint, true)
   for (const removed of ['openaiModel', 'qwenModel', 'floorComposerEnabled']) assert.equal(removed in stored, false)

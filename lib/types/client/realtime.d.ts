@@ -1,4 +1,5 @@
 export interface TranscriptMeta {
+    silenceMs?: number;
     utteranceId?: string;
     likelyEcho?: boolean;
     capturedWhileBusy?: boolean;
@@ -6,6 +7,10 @@ export interface TranscriptMeta {
 }
 export interface RealtimeCallbacks {
     onState(state: 'connecting' | 'listening' | 'speaking' | 'error', detail?: string): void;
+    onAudioInfo?(info: {
+        capture: 'audio-worklet';
+        echoCancellation?: boolean;
+    }): void;
     onSpeechStart?(meta?: TranscriptMeta): void;
     onSpeechEnd?(meta?: TranscriptMeta): void;
     onPartialTranscript?(text: string, meta?: TranscriptMeta): void;
